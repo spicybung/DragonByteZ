@@ -1,0 +1,5 @@
+#include <windows.h>
+
+101 ICON "DragonByteZ.ico"
+102 WAVE "DragonByteZ_intro.wav"
+1 RT_MANIFEST "DragonByteZ.manifest"
