@@ -2,6 +2,7 @@
 
 #include "dragonbytez/analysis.hpp"
 #include "dragonbytez/gsf_player.hpp"
+#include "dragonbytez/log1_runtime.hpp"
 #include "dragonbytez/rom.hpp"
 
 #include <windows.h>
@@ -19,6 +20,7 @@
 #include <array>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
@@ -38,11 +40,17 @@ constexpr wchar_t splash_class_name[] = L"DragonByteZSplashWindow";
 constexpr COLORREF splash_transparency_key = RGB(1, 0, 1);
 constexpr int application_icon_id = 101;
 constexpr int intro_audio_id = 102;
-constexpr wchar_t application_title[] = L"DragonByteZ 0.6.23";
+constexpr int header_banner_id = 103;
+constexpr wchar_t application_title[] = L"DragonByteZ 0.7.8";
 constexpr UINT message_analysis_finished = WM_APP + 1;
 constexpr UINT message_analysis_failed = WM_APP + 2;
+constexpr UINT message_soundtrack_finished = WM_APP + 3;
+constexpr UINT message_soundtrack_failed = WM_APP + 4;
 constexpr UINT_PTR dragon_ball_timer_id = 2;
-constexpr unsigned bgm_preview_seconds = 180;
+constexpr unsigned bgm_preview_seconds = 60;
+constexpr unsigned bgm_full_maximum_seconds = 480;
+constexpr unsigned audio_skip_milliseconds = 10000;
+constexpr wchar_t audio_alias[] = L"dragonbytez_preview_audio";
 constexpr int header_height = 78;
 constexpr int content_margin = 18;
 constexpr int setup_panel_top = 96;
@@ -68,7 +76,12 @@ enum ControlId {
     control_open_sprite_gallery,
     control_preview_image,
     control_preview_text,
-    control_preview_selected,
+    control_audio_play,
+    control_audio_pause,
+    control_audio_stop,
+    control_audio_skip_back,
+    control_audio_skip_forward,
+    control_audio_play_full,
     control_level_information,
     control_open_repository
 };
@@ -91,8 +104,15 @@ struct ApplicationState {
     HWND open_sprite_gallery = nullptr;
     HWND preview_image = nullptr;
     HWND preview_text = nullptr;
-    HWND preview_selected = nullptr;
+    HWND audio_play = nullptr;
+    HWND audio_pause = nullptr;
+    HWND audio_stop = nullptr;
+    HWND audio_skip_back = nullptr;
+    HWND audio_skip_forward = nullptr;
+    HWND audio_play_full = nullptr;
+    std::filesystem::path current_audio_path;
     std::unique_ptr<Gdiplus::Image> preview_bitmap;
+    std::unique_ptr<Gdiplus::Image> header_banner;
     HFONT normal_font = nullptr;
     HFONT title_font = nullptr;
     HFONT subtitle_font = nullptr;
@@ -104,6 +124,7 @@ struct ApplicationState {
     HBRUSH accent_pressed_brush = nullptr;
     HBRUSH border_brush = nullptr;
     bool running = false;
+    bool audio_rendering = false;
     dragonbytez::GameFamily current_game_family =
         dragonbytez::GameFamily::unknown;
 };
@@ -111,8 +132,110 @@ struct ApplicationState {
 ApplicationState application;
 ULONG_PTR gdiplus_token = 0;
 unsigned dragon_ball_tick = 0;
+unsigned audio_progress_poll_tick = 0;
 
 HICON load_dragonbytez_icon(HINSTANCE instance, int width, int height);
+
+std::unique_ptr<Gdiplus::Image> load_png_from_resource(HINSTANCE instance, int resource_id) {
+    HRSRC resource = FindResourceW(
+        instance,
+        MAKEINTRESOURCEW(resource_id),
+        L"PNG");
+    if (!resource) return {};
+
+    const DWORD size = SizeofResource(instance, resource);
+    if (size == 0) return {};
+
+    HGLOBAL loaded = LoadResource(instance, resource);
+    if (!loaded) return {};
+
+    const void* data = LockResource(loaded);
+    if (!data) return {};
+
+    HGLOBAL copy = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (!copy) return {};
+
+    void* copy_data = GlobalLock(copy);
+    if (!copy_data) {
+        GlobalFree(copy);
+        return {};
+    }
+    std::memcpy(copy_data, data, size);
+    GlobalUnlock(copy);
+
+    IStream* stream = nullptr;
+    if (CreateStreamOnHGlobal(copy, TRUE, &stream) != S_OK) {
+        GlobalFree(copy);
+        return {};
+    }
+
+    std::unique_ptr<Gdiplus::Bitmap> bitmap(Gdiplus::Bitmap::FromStream(stream));
+    stream->Release();
+    if (!bitmap || bitmap->GetLastStatus() != Gdiplus::Ok) return {};
+    return std::unique_ptr<Gdiplus::Image>(bitmap.release());
+}
+
+RECT header_banner_bounds() {
+    RECT bounds{24, 8, 259, 62};
+    if (application.header_banner) {
+        const UINT width = application.header_banner->GetWidth();
+        const UINT height = application.header_banner->GetHeight();
+        if (width > 0 && height > 0) {
+            constexpr int target_height = 54;
+            const int target_width = std::max(
+                1,
+                int(std::lround(double(width) * target_height / double(height))));
+            bounds.right = bounds.left + target_width;
+            bounds.bottom = bounds.top + target_height;
+            return bounds;
+        }
+    }
+
+    if (HWND title = GetDlgItem(application.window, 2001)) {
+        GetWindowRect(title, &bounds);
+        MapWindowPoints(
+            nullptr,
+            application.window,
+            reinterpret_cast<POINT*>(&bounds),
+            2);
+    }
+    return bounds;
+}
+
+void draw_header_banner(HDC device) {
+    if (!application.header_banner) return;
+    const RECT bounds = header_banner_bounds();
+    const LONG raw_width = bounds.right - bounds.left;
+    const LONG raw_height = bounds.bottom - bounds.top;
+    const int draw_width = raw_width > 1L
+        ? static_cast<int>(raw_width)
+        : 1;
+    const int draw_height = raw_height > 1L
+        ? static_cast<int>(raw_height)
+        : 1;
+
+    Gdiplus::Graphics graphics(device);
+    graphics.SetInterpolationMode(Gdiplus::InterpolationModeNearestNeighbor);
+    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+    graphics.DrawImage(
+        application.header_banner.get(),
+        bounds.left,
+        bounds.top,
+        draw_width,
+        draw_height);
+}
+
+std::wstring short_path_for_mci(const std::filesystem::path& path) {
+    std::wstring native = path.wstring();
+    std::vector<wchar_t> buffer(32768, L'\0');
+    const DWORD length = GetShortPathNameW(
+        native.c_str(),
+        buffer.data(),
+        static_cast<DWORD>(buffer.size()));
+    if (length == 0 || length >= buffer.size()) return native;
+    return std::wstring(buffer.data(), buffer.data() + length);
+}
 
 std::wstring utf8_to_wide(const std::string& text) {
     if (text.empty()) return {};
@@ -248,17 +371,39 @@ std::filesystem::path select_folder_dialog(
     return directory;
 }
 
+void update_analysis_busy_state() {
+    const bool busy = application.running || application.audio_rendering;
+    EnableWindow(application.rom_path, !busy);
+    EnableWindow(GetDlgItem(application.window, control_browse_rom), !busy);
+    EnableWindow(application.output_path, !busy);
+    EnableWindow(GetDlgItem(application.window, control_browse_output), !busy);
+    EnableWindow(application.analyze, !busy);
+    ShowWindow(application.progress, busy ? SW_SHOW : SW_HIDE);
+    SendMessageW(application.progress, PBM_SETMARQUEE, busy ? TRUE : FALSE, 30);
+}
+
 void set_running(bool running) {
     application.running = running;
-    EnableWindow(application.rom_path, !running);
-    EnableWindow(GetDlgItem(application.window, control_browse_rom), !running);
-    EnableWindow(application.output_path, !running);
-    EnableWindow(GetDlgItem(application.window, control_browse_output), !running);
-    EnableWindow(application.graphics, !running);
-    EnableWindow(application.soundtrack, !running);
-    EnableWindow(application.analyze, !running);
-    ShowWindow(application.progress, running ? SW_SHOW : SW_HIDE);
-    SendMessageW(application.progress, PBM_SETMARQUEE, running ? TRUE : FALSE, 30);
+    update_analysis_busy_state();
+}
+
+void set_audio_rendering(bool rendering) {
+    application.audio_rendering = rendering;
+    audio_progress_poll_tick = 0;
+    update_analysis_busy_state();
+}
+
+void poll_audio_progress() {
+    if (!application.audio_rendering) return;
+
+    const std::filesystem::path progress_path =
+        selected_output_directory() / L"soundtrack" / L".audio_progress.txt";
+    std::ifstream progress(progress_path, std::ios::binary);
+    if (!progress) return;
+
+    std::string message;
+    if (!std::getline(progress, message) || message.empty()) return;
+    SetWindowTextW(application.status, utf8_to_wide(message).c_str());
 }
 
 void populate_results(const std::filesystem::path& output_directory) {
@@ -273,9 +418,8 @@ void populate_results(const std::filesystem::path& output_directory) {
         const auto extension = entry.path().extension().wstring();
         if (extension == L".png" || extension == L".wav" ||
             extension == L".csv" || extension == L".txt" ||
-            extension == L".xlsx" || extension == L".minigsf" ||
-            extension == L".gsflib" || extension == L".m3u" ||
-            extension == L".bin" || extension == L".html") {
+            extension == L".xlsx" || extension == L".m3u" ||
+            extension == L".html") {
             files.push_back(std::filesystem::relative(
                 entry.path(), output_directory));
         }
@@ -327,13 +471,150 @@ std::filesystem::path selected_result_path() {
     return selected_output_directory() / relative;
 }
 
+
+void close_preview_audio() {
+    mciSendStringW(
+        (std::wstring(L"close ") + audio_alias).c_str(),
+        nullptr,
+        0,
+        nullptr);
+    application.current_audio_path.clear();
+}
+
+std::wstring make_mci_open_command(
+    const std::wstring& path,
+    bool force_waveaudio) {
+    std::wstring command(L"open \"");
+    command.append(path);
+    command.append(L"\"");
+    if (force_waveaudio) {
+        command.append(L" type waveaudio");
+    }
+    command.append(L" alias ");
+    command.append(audio_alias);
+    return command;
+}
+
+void open_preview_audio(const std::filesystem::path& path) {
+    if (application.current_audio_path == path) return;
+    close_preview_audio();
+
+    const std::wstring native = path.wstring();
+    const std::wstring short_path = short_path_for_mci(path);
+    const std::array<std::wstring, 4> commands = {
+        make_mci_open_command(native, false),
+        make_mci_open_command(native, true),
+        make_mci_open_command(short_path, false),
+        make_mci_open_command(short_path, true)};
+    MCIERROR opened = 0;
+    bool success = false;
+    for (const std::wstring& command : commands) {
+        opened = mciSendStringW(command.c_str(), nullptr, 0, application.window);
+        if (opened == 0) {
+            success = true;
+            break;
+        }
+        close_preview_audio();
+    }
+    if (!success) {
+        throw std::runtime_error(
+            "Windows could not open the WAV file: " +
+            std::string(path.filename().string()));
+    }
+    const std::wstring set_format =
+        std::wstring(L"set ") + audio_alias +
+        L" time format milliseconds";
+    const MCIERROR formatted = mciSendStringW(
+        set_format.c_str(), nullptr, 0, application.window);
+    if (formatted != 0) {
+        close_preview_audio();
+        throw std::runtime_error(
+            "Windows could not configure WAV seeking");
+    }
+    application.current_audio_path = path;
+}
+
+void play_preview_audio_file(const std::filesystem::path& path) {
+    try {
+        open_preview_audio(path);
+        const std::wstring command =
+            std::wstring(L"play ") + audio_alias;
+        const MCIERROR played = mciSendStringW(
+            command.c_str(), nullptr, 0, application.window);
+        if (played != 0) {
+            throw std::runtime_error("Windows could not play the WAV file");
+        }
+        SetWindowTextW(application.status, L"Playing selected WAV.");
+    } catch (const std::exception& error) {
+        show_error(utf8_to_wide(error.what()));
+    }
+}
+
+void pause_preview_audio() {
+    const std::wstring command =
+        std::wstring(L"pause ") + audio_alias;
+    const MCIERROR paused = mciSendStringW(
+        command.c_str(), nullptr, 0, application.window);
+    if (paused == 0) {
+        SetWindowTextW(application.status, L"Playback paused.");
+    }
+}
+
+void stop_preview_audio() {
+    const std::wstring stop_command =
+        std::wstring(L"stop ") + audio_alias;
+    mciSendStringW(stop_command.c_str(), nullptr, 0, application.window);
+    const std::wstring seek_command =
+        std::wstring(L"seek ") + audio_alias + L" to start";
+    mciSendStringW(seek_command.c_str(), nullptr, 0, application.window);
+    SetWindowTextW(application.status, L"Playback stopped.");
+}
+
+unsigned mci_status_value(const wchar_t* field) {
+    std::array<wchar_t, 64> buffer{};
+    const std::wstring command =
+        std::wstring(L"status ") + audio_alias + L" " + field;
+    const MCIERROR error = mciSendStringW(
+        command.c_str(),
+        buffer.data(),
+        static_cast<UINT>(buffer.size()),
+        application.window);
+    if (error != 0) return 0U;
+    try {
+        return static_cast<unsigned>(std::stoul(buffer.data()));
+    } catch (const std::exception&) {
+        return 0U;
+    }
+}
+
+void skip_preview_audio(int direction) {
+    if (application.current_audio_path.empty()) return;
+    const unsigned position = mci_status_value(L"position");
+    const unsigned length = mci_status_value(L"length");
+    std::int64_t destination = static_cast<std::int64_t>(position) +
+        static_cast<std::int64_t>(direction) *
+            static_cast<std::int64_t>(audio_skip_milliseconds);
+    destination = std::clamp<std::int64_t>(
+        destination,
+        0,
+        static_cast<std::int64_t>(length));
+    const std::wstring seek_command =
+        std::wstring(L"seek ") + audio_alias + L" to " +
+        std::to_wstring(destination);
+    const MCIERROR sought = mciSendStringW(
+        seek_command.c_str(), nullptr, 0, application.window);
+    if (sought == 0) {
+        const std::wstring play_command =
+            std::wstring(L"play ") + audio_alias;
+        mciSendStringW(
+            play_command.c_str(), nullptr, 0, application.window);
+    }
+}
+
 void clear_preview() {
-    PlaySoundW(nullptr, nullptr, 0);
+    close_preview_audio();
     application.preview_bitmap.reset();
-    SetWindowTextW(
-        application.preview_text,
-        L"Select an image, report, sample, sequence, or GSF track to "
-        L"preview it here.");
+    SetWindowTextW(application.preview_text, L"");
     ShowWindow(application.preview_image, SW_HIDE);
     ShowWindow(application.preview_text, SW_SHOW);
     InvalidateRect(application.preview_image, nullptr, TRUE);
@@ -360,7 +641,19 @@ bool track_index_from_path(
     return true;
 }
 
-void play_internal_bgm(std::size_t track) {
+void set_audio_controls_enabled(bool enabled) {
+    for (HWND control : {
+             application.audio_play,
+             application.audio_pause,
+             application.audio_stop,
+             application.audio_skip_back,
+             application.audio_skip_forward,
+             application.audio_play_full}) {
+        if (control) EnableWindow(control, enabled ? TRUE : FALSE);
+    }
+}
+
+void play_internal_bgm(std::size_t track, bool full_track) {
     const std::filesystem::path rom_path(
         get_window_text(application.rom_path));
     if (!std::filesystem::is_regular_file(rom_path)) {
@@ -368,13 +661,15 @@ void play_internal_bgm(std::size_t track) {
         return;
     }
 
-    const std::filesystem::path preview_directory =
-        selected_output_directory() / L"soundtrack" /
-        L"level_music" / L"preview_cache";
+    const std::filesystem::path cache_directory =
+        selected_output_directory() / L"soundtrack" / L"level_music" /
+        (full_track ? L"full_cache" : L"preview_cache");
     SetWindowTextW(
         application.status,
-        L"Rendering track with DragonByteZ's embedded GBA audio engine...");
-    EnableWindow(application.preview_selected, FALSE);
+        full_track
+            ? L"Rendering the complete selected track from the ROM..."
+            : L"Rendering a one-minute selected-track preview...");
+    set_audio_controls_enabled(false);
     const HCURSOR previous_cursor =
         SetCursor(LoadCursorW(nullptr, IDC_WAIT));
     try {
@@ -382,40 +677,62 @@ void play_internal_bgm(std::size_t track) {
         std::wostringstream filename;
         filename << L"track_" << std::setw(2) << std::setfill(L'0')
                  << track << L"_" << utf8_to_wide(rom.game_code())
-                 << L"_v0618_180s.wav";
-        const std::filesystem::path preview_path =
-            preview_directory / filename.str();
-        if (!std::filesystem::is_regular_file(preview_path)) {
-            dragonbytez::render_bgm_preview_wav(
-                rom, track, preview_path, bgm_preview_seconds);
+                 << (full_track ? L"_v070_full.wav" : L"_v070_60s.wav");
+        const std::filesystem::path wav_path =
+            cache_directory / filename.str();
+        if (!std::filesystem::is_regular_file(wav_path)) {
+            if (dragonbytez::is_log1_rom(rom)) {
+                if (full_track) {
+                    dragonbytez::render_log1_runtime_track_full_wav(
+                        rom,
+                        track,
+                        wav_path,
+                        bgm_full_maximum_seconds,
+                        2,
+                        5);
+                } else {
+                    dragonbytez::render_log1_runtime_track_preview_wav(
+                        rom,
+                        track,
+                        wav_path,
+                        bgm_preview_seconds);
+                }
+            } else if (full_track) {
+                dragonbytez::render_bgm_full_wav(
+                    rom,
+                    track,
+                    wav_path,
+                    bgm_full_maximum_seconds,
+                    2,
+                    5);
+            } else {
+                dragonbytez::render_bgm_preview_wav(
+                    rom,
+                    track,
+                    wav_path,
+                    bgm_preview_seconds);
+            }
         }
-        if (!PlaySoundW(
-                preview_path.c_str(), nullptr,
-                SND_FILENAME | SND_ASYNC | SND_NODEFAULT)) {
-            throw std::runtime_error(
-                "Windows could not play the rendered BGM preview");
-        }
-        std::wostringstream description;
-        description
-            << L"Webfoot level music\r\n\r\nTrack "
-            << std::setw(2) << std::setfill(L'0') << track
-            << L"\r\n\r\nPlaying a three-minute stereo render created "
-               L"on demand inside DragonByteZ by its embedded GBA audio "
-               L"engine.\r\n\r\n"
-            << L"Cached WAV:\r\n" << preview_path.wstring();
+        play_preview_audio_file(wav_path);
         SetWindowTextW(
-            application.preview_text, description.str().c_str());
+            application.preview_text,
+            L"");
         SetWindowTextW(
             application.status,
-            L"Playing internally rendered level music.");
+            full_track
+                ? L"Playing the complete extracted track."
+                : L"Playing the selected-track preview.");
     } catch (const std::exception& error) {
         SetWindowTextW(
-            application.status, L"Music preview failed.");
+            application.status,
+            full_track ? L"Full-track rendering failed."
+                       : L"Track preview failed.");
         show_error(utf8_to_wide(error.what()));
     }
     SetCursor(previous_cursor);
-    EnableWindow(application.preview_selected, TRUE);
+    set_audio_controls_enabled(true);
 }
+
 
 void show_selected_preview(bool play_audio) {
     const auto path = selected_result_path();
@@ -449,18 +766,11 @@ void show_selected_preview(bool play_audio) {
     ShowWindow(application.preview_text, SW_SHOW);
 
     if (extension == L".wav") {
-        std::wostringstream description;
-        description << L"GBA PCM sample\r\n\r\n" << path.filename().wstring()
-                    << L"\r\n\r\nUse Preview / Play to hear it.";
-        SetWindowTextW(application.preview_text, description.str().c_str());
-        if (play_audio &&
-            !PlaySoundW(
-                path.c_str(), nullptr,
-                SND_FILENAME | SND_ASYNC | SND_NODEFAULT)) {
-            show_error(L"Windows could not play this WAV sample.");
-        }
+        SetWindowTextW(application.preview_text, L"");
+        if (play_audio) play_preview_audio_file(path);
         return;
     }
+
 
     if (extension == L".minigsf" || extension == L".gsflib" ||
         extension == L".m3u") {
@@ -475,15 +785,15 @@ void show_selected_preview(bool play_audio) {
                L"Webfoot GBA sound engine.\r\n";
         if (has_track) {
             description
-                << L"Use Preview / Play to render and play it directly "
-                   L"inside DragonByteZ.";
+                << L"Use ▶ for a one-minute render or ▶ Full for the "
+                   L"complete extracted track.";
         } else {
             description
                 << L"Select one of the track_XX.minigsf entries to play "
                    L"a track inside DragonByteZ.";
         }
         SetWindowTextW(application.preview_text, description.str().c_str());
-        if (play_audio && has_track) play_internal_bgm(track);
+        if (play_audio && has_track) play_internal_bgm(track, false);
         return;
     }
 
@@ -512,7 +822,7 @@ void show_selected_preview(bool play_audio) {
         SetWindowTextW(application.preview_text, description.str().c_str());
         std::size_t track = 0;
         if (play_audio && track_index_from_path(path, track)) {
-            play_internal_bgm(track);
+            play_internal_bgm(track, false);
         }
         return;
     }
@@ -552,9 +862,9 @@ void inspect_rom(const std::filesystem::path& path) {
         application.current_game_family = dragonbytez::game_family(rom);
         std::wstring profile = L"Unknown or unsupported";
         if (dragonbytez::is_log2_rom(rom)) {
-            profile = L"Legacy of Goku II " +
-                utf8_to_wide(dragonbytez::profile_for(rom).name) +
-                L" (supported)";
+            profile.assign(L"Legacy of Goku II ");
+            profile.append(utf8_to_wide(dragonbytez::profile_for(rom).name));
+            profile.append(L" (supported)");
         } else if (dragonbytez::is_log1_rom(rom)) {
             profile = L"Legacy of Goku Europe Rev 0 ALGP (BIOS asset support)";
         } else if (dragonbytez::is_buus_fury_rom(rom)) {
@@ -601,7 +911,7 @@ void inspect_rom(const std::filesystem::path& path) {
             application.open_sprite_gallery,
             has_verified_sprite_gallery
                 ? L"Sprite Gallery"
-                : L"Sprites not decoded");
+                : L"Sprite Gallery");
         InvalidateRect(application.open_sprite_gallery, nullptr, TRUE);
 
         SetWindowTextW(
@@ -612,7 +922,7 @@ void inspect_rom(const std::filesystem::path& path) {
     } catch (const std::exception& error) {
         application.current_game_family = dragonbytez::GameFamily::unknown;
         EnableWindow(application.open_sprite_gallery, FALSE);
-        SetWindowTextW(application.open_sprite_gallery, L"Sprites not decoded");
+        SetWindowTextW(application.open_sprite_gallery, L"Sprite Gallery");
         InvalidateRect(application.open_sprite_gallery, nullptr, TRUE);
         SetWindowTextW(application.rom_information, L"No valid ROM loaded.");
         SetWindowTextW(
@@ -634,10 +944,6 @@ void choose_output_directory() {
 void run_analysis() {
     const std::filesystem::path rom_path(get_window_text(application.rom_path));
     const std::filesystem::path output_path = selected_output_directory();
-    const bool graphics =
-        SendMessageW(application.graphics, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    const bool soundtrack =
-        SendMessageW(application.soundtrack, BM_GETCHECK, 0, 0) == BST_CHECKED;
 
     if (rom_path.empty() || !std::filesystem::is_regular_file(rom_path)) {
         show_error(L"Select a valid .gba ROM first.");
@@ -647,35 +953,45 @@ void run_analysis() {
         show_error(L"Select an output directory first.");
         return;
     }
-    if (!graphics && !soundtrack) {
-        show_error(L"Enable Maps / tiles, Audio / music, or both.");
-        return;
-    }
 
     SendMessageW(application.results, LB_RESETCONTENT, 0, 0);
     clear_preview();
     SetWindowTextW(
         application.status,
-        L"Analyzing the ROM and writing fresh output files...");
+        L"Extracting sprites, tilesets, levels, and galleries first...");
+    set_audio_rendering(false);
     set_running(true);
 
     const HWND target_window = application.window;
-    std::thread([target_window, rom_path, output_path, graphics, soundtrack]() {
+    std::thread([target_window, rom_path, output_path]() {
         try {
             const dragonbytez::Rom rom(rom_path);
-            if (graphics && soundtrack) {
-                dragonbytez::analyze_all(rom, output_path);
-            } else if (graphics) {
-                std::filesystem::create_directories(output_path);
-                dragonbytez::analyze_graphics(rom, output_path / "graphics");
-            } else {
-                std::filesystem::create_directories(output_path);
-                dragonbytez::analyze_soundtrack(rom, output_path / "soundtrack");
-            }
-            auto* result = new std::wstring(output_path.wstring());
+            std::filesystem::create_directories(output_path);
+            dragonbytez::analyze_graphics(rom, output_path / "graphics");
+
+            auto* graphics_result = new std::wstring(output_path.wstring());
             PostMessageW(
-                target_window, message_analysis_finished, 0,
-                reinterpret_cast<LPARAM>(result));
+                target_window,
+                message_analysis_finished,
+                0,
+                reinterpret_cast<LPARAM>(graphics_result));
+
+            try {
+                dragonbytez::analyze_soundtrack(rom, output_path / "soundtrack");
+                auto* soundtrack_result = new std::wstring(output_path.wstring());
+                PostMessageW(
+                    target_window,
+                    message_soundtrack_finished,
+                    0,
+                    reinterpret_cast<LPARAM>(soundtrack_result));
+            } catch (const std::exception& error) {
+                auto* soundtrack_error = new std::wstring(utf8_to_wide(error.what()));
+                PostMessageW(
+                    target_window,
+                    message_soundtrack_failed,
+                    0,
+                    reinterpret_cast<LPARAM>(soundtrack_error));
+            }
         } catch (const std::exception& error) {
             auto* result = new std::wstring(utf8_to_wide(error.what()));
             PostMessageW(
@@ -683,6 +999,43 @@ void run_analysis() {
                 reinterpret_cast<LPARAM>(result));
         }
     }).detach();
+}
+
+
+void play_selected_audio(bool full_track) {
+    const std::filesystem::path path = selected_result_path();
+    if (path.empty() || !std::filesystem::is_regular_file(path)) {
+        SetWindowTextW(application.status, L"Select an extracted WAV or track.");
+        return;
+    }
+
+    std::wstring extension = path.extension().wstring();
+    std::transform(
+        extension.begin(), extension.end(), extension.begin(),
+        [](wchar_t value) {
+            return static_cast<wchar_t>(std::towlower(value));
+        });
+    if (extension == L".wav") {
+        std::size_t wav_track = 0;
+        const bool preview_cache =
+            path.wstring().find(L"preview_cache") != std::wstring::npos;
+        if (full_track && preview_cache &&
+            track_index_from_path(path, wav_track)) {
+            play_internal_bgm(wav_track, true);
+        } else {
+            play_preview_audio_file(path);
+        }
+        return;
+    }
+
+    std::size_t track = 0;
+    if (track_index_from_path(path, track)) {
+        play_internal_bgm(track, full_track);
+        return;
+    }
+    SetWindowTextW(
+        application.status,
+        L"The selected asset is not playable audio.");
 }
 
 void open_selected_result() {
@@ -698,7 +1051,7 @@ void open_selected_result() {
     if (extension == L".minigsf" || extension == L".bin") {
         std::size_t track = 0;
         if (track_index_from_path(path, track)) {
-            play_internal_bgm(track);
+            play_internal_bgm(track, false);
             return;
         }
     }
@@ -711,6 +1064,12 @@ void open_selected_result() {
 }
 
 void open_contact_sheet() {
+    const std::filesystem::path tileset_gallery =
+        selected_output_directory() / L"graphics" / L"tileset_gallery.html";
+    if (std::filesystem::is_regular_file(tileset_gallery)) {
+        open_in_shell(tileset_gallery);
+        return;
+    }
     const std::filesystem::path gallery =
         selected_output_directory() / L"graphics" / L"level_gallery.html";
     if (std::filesystem::is_regular_file(gallery)) {
@@ -804,6 +1163,10 @@ void layout_controls(int width, int height) {
                235, 34, TRUE);
     MoveWindow(GetDlgItem(application.window, 2006), 25, 42,
                std::max(320, width - 50), 24, TRUE);
+    if (application.header_banner) {
+        ShowWindow(GetDlgItem(application.window, 2001), SW_HIDE);
+        ShowWindow(GetDlgItem(application.window, 2006), SW_HIDE);
+    }
 
     MoveWindow(GetDlgItem(application.window, 2002), content_margin + 14, 108,
                label_width - 4, 30, TRUE);
@@ -827,14 +1190,14 @@ void layout_controls(int width, int height) {
         std::max(300, width - content_margin - 14 - action_x);
     MoveWindow(application.rom_information, content_margin + 14, 188,
                information_width - 20, 86, TRUE);
-    MoveWindow(application.graphics, action_x, 194, 128, 26, TRUE);
-    MoveWindow(application.soundtrack, action_x + 144, 194, 140, 26, TRUE);
-    MoveWindow(application.analyze, action_x, 228, 142, 36, TRUE);
-    MoveWindow(application.open_output, action_x + 152, 228, 128, 36, TRUE);
-    MoveWindow(application.progress, action_x + 292, 237,
+    ShowWindow(application.graphics, SW_HIDE);
+    ShowWindow(application.soundtrack, SW_HIDE);
+    MoveWindow(application.analyze, action_x, 194, 142, 36, TRUE);
+    MoveWindow(application.open_output, action_x + 152, 194, 128, 36, TRUE);
+    MoveWindow(application.progress, action_x + 292, 203,
                std::max(80, action_width - 292), 18, TRUE);
-    MoveWindow(application.level_information, content_margin + 14, 290,
-               content_width - 28, 70, TRUE);
+    MoveWindow(application.level_information, content_margin + 14, 274,
+               content_width - 28, 86, TRUE);
 
     const int results_width = std::max(320, content_width * 42 / 100);
     const int preview_x = content_margin + results_width + 14;
@@ -862,10 +1225,27 @@ void layout_controls(int width, int height) {
                116, 34, TRUE);
     MoveWindow(application.open_sprite_gallery, content_margin + 238, button_y,
                116, 34, TRUE);
-    MoveWindow(application.preview_selected, preview_x, button_y,
-               132, 34, TRUE);
-    MoveWindow(application.status, preview_x + 146, button_y,
-               std::max(180, width - content_margin - preview_x - 146),
+    int audio_x = preview_x;
+    MoveWindow(application.audio_skip_back, audio_x, button_y,
+               46, 34, TRUE);
+    audio_x += 52;
+    MoveWindow(application.audio_play, audio_x, button_y,
+               42, 34, TRUE);
+    audio_x += 48;
+    MoveWindow(application.audio_pause, audio_x, button_y,
+               42, 34, TRUE);
+    audio_x += 48;
+    MoveWindow(application.audio_stop, audio_x, button_y,
+               42, 34, TRUE);
+    audio_x += 48;
+    MoveWindow(application.audio_skip_forward, audio_x, button_y,
+               46, 34, TRUE);
+    audio_x += 52;
+    MoveWindow(application.audio_play_full, audio_x, button_y,
+               82, 34, TRUE);
+    audio_x += 92;
+    MoveWindow(application.status, audio_x, button_y,
+               std::max(80, width - content_margin - audio_x),
                34, TRUE);
 }
 
@@ -902,13 +1282,20 @@ void create_controls() {
     application.border_brush = CreateSolidBrush(RGB(83, 94, 106));
 
     HWND title = create_control(
-        0, L"STATIC", L"DragonByteZ",
+        0, L"STATIC", L"",
         SS_LEFT | SS_CENTERIMAGE, 2001);
     set_control_font(title, application.title_font);
     HWND subtitle = create_control(
-        0, L"STATIC", L"Legacy of Goku I / II and Buu\'s Fury asset workspace",
+        0, L"STATIC", L"",
         SS_LEFT | SS_CENTERIMAGE, 2006);
     set_control_font(subtitle, application.subtitle_font);
+    application.header_banner = load_png_from_resource(
+        GetModuleHandleW(nullptr),
+        header_banner_id);
+    if (application.header_banner) {
+        ShowWindow(title, SW_HIDE);
+        ShowWindow(subtitle, SW_HIDE);
+    }
 
     HWND rom_label = create_control(
         0, L"STATIC", L"ROM file", SS_LEFT | SS_CENTERIMAGE, 2002);
@@ -931,24 +1318,26 @@ void create_controls() {
         BS_OWNERDRAW | WS_TABSTOP, control_browse_output);
 
     application.rom_information = create_control(
-        WS_EX_CLIENTEDGE, L"EDIT", L"No ROM loaded.",
+        WS_EX_CLIENTEDGE, L"EDIT", L"",
         ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
         control_rom_information);
     application.level_information = create_control(
-        WS_EX_CLIENTEDGE, L"EDIT", L"No level information loaded.",
+        WS_EX_CLIENTEDGE, L"EDIT", L"",
         ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
         control_level_information);
 
     application.graphics = create_control(
-        0, L"BUTTON", L"Graphics / levels",
+        0, L"BUTTON", L"Sprites / tilesets / levels",
         BS_AUTOCHECKBOX | WS_TABSTOP, control_graphics);
     application.soundtrack = create_control(
-        0, L"BUTTON", L"WAV track previews (slower)",
+        0, L"BUTTON", L"Full WAV tracks + SFX",
         BS_AUTOCHECKBOX | WS_TABSTOP, control_soundtrack);
     SendMessageW(application.graphics, BM_SETCHECK, BST_CHECKED, 0);
-    SendMessageW(application.soundtrack, BM_SETCHECK, BST_UNCHECKED, 0);
+    SendMessageW(application.soundtrack, BM_SETCHECK, BST_CHECKED, 0);
     SetWindowTheme(application.graphics, L"", L"");
     SetWindowTheme(application.soundtrack, L"", L"");
+    ShowWindow(application.graphics, SW_HIDE);
+    ShowWindow(application.soundtrack, SW_HIDE);
 
     application.analyze = create_control(
         0, L"BUTTON", L"Analyze ROM",
@@ -978,7 +1367,7 @@ void create_controls() {
         0, L"BUTTON", L"Open Selected",
         BS_OWNERDRAW | WS_TABSTOP, control_open_selected);
     application.open_contact_sheet = create_control(
-        0, L"BUTTON", L"Level Gallery",
+        0, L"BUTTON", L"Tileset Gallery",
         BS_OWNERDRAW | WS_TABSTOP, control_open_contact_sheet);
     application.open_sprite_gallery = create_control(
         0, L"BUTTON", L"Sprite Gallery",
@@ -988,22 +1377,35 @@ void create_controls() {
         WS_EX_CLIENTEDGE, L"STATIC", L"",
         SS_OWNERDRAW, control_preview_image);
     application.preview_text = create_control(
-        WS_EX_CLIENTEDGE, L"EDIT",
-        L"Select an image, report, sample, sequence, or GSF track to "
-        L"preview it here.",
+        WS_EX_CLIENTEDGE, L"EDIT", L"",
         ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
         control_preview_text);
-    application.preview_selected = create_control(
-        0, L"BUTTON", L"Preview / Play",
-        BS_OWNERDRAW | WS_TABSTOP, control_preview_selected);
+    application.audio_skip_back = create_control(
+        0, L"BUTTON", L"⏪",
+        BS_OWNERDRAW | WS_TABSTOP, control_audio_skip_back);
+    application.audio_play = create_control(
+        0, L"BUTTON", L"▶",
+        BS_OWNERDRAW | WS_TABSTOP, control_audio_play);
+    application.audio_pause = create_control(
+        0, L"BUTTON", L"⏸",
+        BS_OWNERDRAW | WS_TABSTOP, control_audio_pause);
+    application.audio_stop = create_control(
+        0, L"BUTTON", L"■",
+        BS_OWNERDRAW | WS_TABSTOP, control_audio_stop);
+    application.audio_skip_forward = create_control(
+        0, L"BUTTON", L"⏩",
+        BS_OWNERDRAW | WS_TABSTOP, control_audio_skip_forward);
+    application.audio_play_full = create_control(
+        0, L"BUTTON", L"▶ Full",
+        BS_OWNERDRAW | WS_TABSTOP, control_audio_play_full);
     ShowWindow(application.preview_image, SW_HIDE);
     application.status = create_control(
-        0, L"STATIC", L"Select LOG1, LOG2, or Buu\'s Fury .gba ROM.",
+        0, L"STATIC", L"",
         SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX, control_status);
 
     SendMessageW(
         application.rom_path, EM_SETCUEBANNER, TRUE,
-        reinterpret_cast<LPARAM>(L"Select ALGP, ALFP, ALFE, or Buu\'s Fury BG3E"));
+        reinterpret_cast<LPARAM>(L"Select a ROM"));
     SendMessageW(
         application.output_path, EM_SETCUEBANNER, TRUE,
         reinterpret_cast<LPARAM>(L"Choose where analysis data will be stored"));
@@ -1022,7 +1424,9 @@ void create_controls() {
              control_browse_rom, control_browse_output, control_analyze,
              control_open_output, control_open_selected,
              control_open_contact_sheet, control_open_sprite_gallery,
-             control_preview_selected}) {
+             control_audio_skip_back, control_audio_play,
+             control_audio_pause, control_audio_stop,
+             control_audio_skip_forward, control_audio_play_full}) {
         SetWindowTheme(GetDlgItem(application.window, id), L"Explorer", nullptr);
     }
 }
@@ -1052,8 +1456,23 @@ LRESULT handle_command(WPARAM wparam) {
     case control_open_sprite_gallery:
         open_sprite_gallery();
         return 0;
-    case control_preview_selected:
-        show_selected_preview(true);
+    case control_audio_play:
+        play_selected_audio(false);
+        return 0;
+    case control_audio_pause:
+        pause_preview_audio();
+        return 0;
+    case control_audio_stop:
+        stop_preview_audio();
+        return 0;
+    case control_audio_skip_back:
+        skip_preview_audio(-1);
+        return 0;
+    case control_audio_skip_forward:
+        skip_preview_audio(1);
+        return 0;
+    case control_audio_play_full:
+        play_selected_audio(true);
         return 0;
     case control_open_repository:
         open_repository();
@@ -1068,7 +1487,7 @@ LRESULT handle_command(WPARAM wparam) {
     case IDHELP:
         MessageBoxW(
             application.window,
-            L"DragonByteZ 0.6.23\r\n\r\n"
+            L"DragonByteZ 0.7.8\r\n\r\n"
             L"Reverse-engineering and asset analysis for "
             L"Dragon Ball Z: The Legacy of Goku I, II, and Buu\'s Fury.\r\n\r\n"
             L"Special Thanks to Zeke Luna\r\n\r\n"
@@ -1090,7 +1509,12 @@ bool is_ds_button(int identifier) {
     case control_open_selected:
     case control_open_contact_sheet:
     case control_open_sprite_gallery:
-    case control_preview_selected:
+    case control_audio_play:
+    case control_audio_pause:
+    case control_audio_stop:
+    case control_audio_skip_back:
+    case control_audio_skip_forward:
+    case control_audio_play_full:
         return true;
     default:
         return false;
@@ -1222,75 +1646,342 @@ std::vector<Gdiplus::PointF> dragon_ball_star_positions(
     return positions;
 }
 
-void draw_dragon_balls(HDC device, const RECT&) {
+HFONT create_header_pixel_font(int height, int weight) {
+    HFONT font = CreateFontW(
+        -height, 0, 0, 0, weight,
+        FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY,
+        FIXED_PITCH | FF_MODERN, L"Terminal");
+    if (font) return font;
+    return CreateFontW(
+        -height, 0, 0, 0, weight,
+        FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Fixedsys");
+}
+
+SIZE measure_header_text(HDC device, HFONT font, const wchar_t* text) {
+    SIZE size{};
+    HGDIOBJ old_font = SelectObject(device, font);
+    GetTextExtentPoint32W(device, text, static_cast<int>(wcslen(text)), &size);
+    SelectObject(device, old_font);
+    return size;
+}
+
+void draw_header_text_shadow(
+    HDC device,
+    int x,
+    int y,
+    HFONT font,
+    COLORREF shadow_colour,
+    COLORREF text_colour,
+    const wchar_t* text) {
+    HGDIOBJ old_font = SelectObject(device, font);
+    SetBkMode(device, TRANSPARENT);
+    SetTextColor(device, shadow_colour);
+    TextOutW(device, x + 2, y + 2, text, static_cast<int>(wcslen(text)));
+    SetTextColor(device, text_colour);
+    TextOutW(device, x, y, text, static_cast<int>(wcslen(text)));
+    SelectObject(device, old_font);
+}
+
+float measure_header_branding_width(HDC device) {
+    HFONT title_font = create_header_pixel_font(34, FW_BOLD);
+    HFONT subtitle_font = create_header_pixel_font(16, FW_NORMAL);
+    const SIZE drag_size = measure_header_text(device, title_font, L"Drag");
+    const SIZE tail_size = measure_header_text(device, title_font, L"nByteZ");
+    const SIZE subtitle_size = measure_header_text(
+        device, subtitle_font, L"Webfoot Dragon Ball Z asset workspace");
+    if (title_font) DeleteObject(title_font);
+    if (subtitle_font) DeleteObject(subtitle_font);
+    const float title_width = static_cast<float>(drag_size.cx + 36 + tail_size.cx);
+    return std::max(title_width, static_cast<float>(subtitle_size.cx));
+}
+
+void draw_header_branding(HDC device, const RECT&) {
+    HFONT title_font = create_header_pixel_font(34, FW_BOLD);
+    HFONT subtitle_font = create_header_pixel_font(16, FW_NORMAL);
+    if (!title_font || !subtitle_font) {
+        if (title_font) DeleteObject(title_font);
+        if (subtitle_font) DeleteObject(subtitle_font);
+        return;
+    }
+
+    constexpr int start_x = 24;
+    constexpr int title_y = 12;
+    constexpr int subtitle_y = 49;
+    const SIZE drag_size = measure_header_text(device, title_font, L"Drag");
+    const int ball_diameter = 32;
+    const int ball_gap = 4;
+    int cursor_x = start_x;
+
+    draw_header_text_shadow(
+        device,
+        cursor_x,
+        title_y,
+        title_font,
+        RGB(92, 30, 0),
+        RGB(255, 154, 43),
+        L"Drag");
+    cursor_x += drag_size.cx;
+
     Gdiplus::Graphics graphics(device);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
 
-    constexpr float first_center_x = 282.0f;
-    constexpr float center_y = 27.0f;
-    constexpr float spacing_x = 39.0f;
-    constexpr float radius = 15.5f;
-    constexpr unsigned ticks_per_ball = 4;
+    const float pulse = 0.5f + 0.5f *
+        std::sin(static_cast<float>(dragon_ball_tick) * 0.15f);
+    const float center_x = static_cast<float>(cursor_x + ball_diameter / 2);
+    const float center_y = 29.0f;
+    const float radius = 13.5f;
 
-    for (unsigned ball = 0; ball < 7; ++ball) {
-        const int age = static_cast<int>(dragon_ball_tick) -
-            static_cast<int>(ball * ticks_per_ball);
-        if (age < 0) continue;
+    Gdiplus::SolidBrush outer_glow(Gdiplus::Color(
+        static_cast<BYTE>(84 + pulse * 46.0f), 255, 118, 18));
+    graphics.FillEllipse(
+        &outer_glow,
+        Gdiplus::RectF(
+            center_x - radius * 1.75f,
+            center_y - radius * 1.75f,
+            radius * 3.5f,
+            radius * 3.5f));
+    Gdiplus::SolidBrush inner_glow(Gdiplus::Color(
+        static_cast<BYTE>(70 + pulse * 60.0f), 255, 225, 72));
+    graphics.FillEllipse(
+        &inner_glow,
+        Gdiplus::RectF(
+            center_x - radius * 1.15f,
+            center_y - radius * 1.15f,
+            radius * 2.3f,
+            radius * 2.3f));
+    Gdiplus::SolidBrush outer_fill(Gdiplus::Color(255, 229, 79, 8));
+    graphics.FillEllipse(
+        &outer_fill,
+        Gdiplus::RectF(
+            center_x - radius,
+            center_y - radius,
+            radius * 2.0f,
+            radius * 2.0f));
+    Gdiplus::SolidBrush inner_fill(Gdiplus::Color(255, 255, 165, 26));
+    graphics.FillEllipse(
+        &inner_fill,
+        Gdiplus::RectF(
+            center_x - radius * 0.84f,
+            center_y - radius * 0.84f,
+            radius * 1.68f,
+            radius * 1.68f));
+    Gdiplus::Pen edge(Gdiplus::Color(255, 255, 219, 92), 1.2f);
+    graphics.DrawEllipse(
+        &edge,
+        Gdiplus::RectF(
+            center_x - radius,
+            center_y - radius,
+            radius * 2.0f,
+            radius * 2.0f));
+    Gdiplus::SolidBrush shine(Gdiplus::Color(210, 255, 243, 188));
+    graphics.FillEllipse(
+        &shine,
+        Gdiplus::RectF(
+            center_x - radius * 0.48f,
+            center_y - radius * 0.62f,
+            radius * 0.56f,
+            radius * 0.34f));
+    Gdiplus::GraphicsPath star_path;
+    add_star_path(star_path, center_x, center_y, 4.0f, 1.8f);
+    Gdiplus::SolidBrush star_brush(Gdiplus::Color(255, 198, 24, 10));
+    graphics.FillPath(&star_brush, &star_path);
 
-        float scale = 1.0f;
-        if (age < 5) {
-            const float amount = static_cast<float>(age + 1) / 5.0f;
-            const float smooth = amount * amount * (3.0f - 2.0f * amount);
-            scale = 0.20f + smooth * 0.92f;
-            if (age >= 3) scale += 0.08f * (5.0f - static_cast<float>(age)) / 2.0f;
-        }
-        const float bob = std::sin(
-            (static_cast<float>(dragon_ball_tick) + ball * 2.1f) * 0.16f) * 1.2f;
-        const float center_x = first_center_x + ball * spacing_x;
-        const float ball_y = center_y + bob;
-        const float draw_radius = radius * scale;
+    cursor_x += ball_diameter + ball_gap;
+    draw_header_text_shadow(
+        device,
+        cursor_x,
+        title_y,
+        title_font,
+        RGB(92, 30, 0),
+        RGB(255, 154, 43),
+        L"nByteZ");
+    draw_header_text_shadow(
+        device,
+        start_x + 2,
+        subtitle_y,
+        subtitle_font,
+        RGB(0, 48, 74),
+        RGB(83, 204, 247),
+        L"Webfoot Dragon Ball Z asset workspace");
 
-        Gdiplus::SolidBrush glow(Gdiplus::Color(42, 255, 115, 15));
+    DeleteObject(title_font);
+    DeleteObject(subtitle_font);
+}
+
+void draw_glow_band(
+    Gdiplus::Graphics& graphics,
+    float center_x,
+    float center_y,
+    float radius,
+    float outer_scale,
+    float inner_scale,
+    unsigned rings,
+    BYTE red,
+    BYTE green,
+    BYTE blue,
+    float maximum_alpha) {
+    if (rings == 0U || maximum_alpha <= 0.0f) return;
+
+    for (unsigned ring = 0; ring < rings; ++ring) {
+        const float amount = rings > 1U
+            ? static_cast<float>(ring) / static_cast<float>(rings - 1U)
+            : 1.0f;
+        const float eased = amount * amount * (3.0f - 2.0f * amount);
+        const float scale = outer_scale + (inner_scale - outer_scale) * eased;
+        const float alpha_weight = 0.14f + 0.86f * eased * eased;
+        const BYTE alpha = static_cast<BYTE>(std::clamp(
+            static_cast<int>(std::lround(maximum_alpha * alpha_weight)),
+            1,
+            255));
+        const float band_radius = radius * scale;
+
+        Gdiplus::SolidBrush brush(Gdiplus::Color(alpha, red, green, blue));
         graphics.FillEllipse(
-            &glow,
+            &brush,
             Gdiplus::RectF(
-                center_x - draw_radius * 1.35f,
-                ball_y - draw_radius * 1.35f,
-                draw_radius * 2.7f,
-                draw_radius * 2.7f));
+                center_x - band_radius,
+                center_y - band_radius,
+                band_radius * 2.0f,
+                band_radius * 2.0f));
+    }
+}
+
+void draw_dragon_balls(HDC device, const RECT& client) {
+    const RECT title_bounds = header_banner_bounds();
+
+    constexpr float right_margin = 26.0f;
+    const float first_edge = static_cast<float>(title_bounds.right) + 14.0f;
+    const float available = static_cast<float>(client.right) -
+        right_margin - first_edge;
+    if (available < 190.0f) return;
+
+    float spacing = std::clamp((available - 48.0f) / 6.8f, 44.0f, 56.0f);
+    const float radius = std::clamp(spacing * 0.225f, 11.5f, 14.0f);
+    const float total_width = radius * 2.0f + spacing * 6.0f;
+    const float first_center_x = first_edge + radius +
+        std::max(8.0f, std::min(18.0f, available - total_width));
+    constexpr float center_y = 29.0f;
+
+    Gdiplus::Graphics graphics(device);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+
+    const bool busy = application.running || application.audio_rendering;
+    const float global_phase = static_cast<float>(dragon_ball_tick) *
+        (busy ? 0.110f : 0.075f);
+    const float bob_phase = static_cast<float>(dragon_ball_tick) *
+        (busy ? 0.200f : 0.125f);
+    const float bob_amplitude = busy ? 3.3f : 2.0f;
+
+    for (unsigned ball = 0; ball < 7U; ++ball) {
+        const float center_x = first_center_x + static_cast<float>(ball) * spacing;
+        if (center_x + radius > static_cast<float>(client.right) - right_margin) {
+            break;
+        }
+
+        const float pulse = 0.5f + 0.5f * std::sin(
+            global_phase + static_cast<float>(ball) * 0.16f);
+        const float shimmer = 0.5f + 0.5f * std::sin(
+            global_phase * 1.70f + static_cast<float>(ball) * 0.31f + 0.65f);
+        const float emission = 0.64f + pulse * 0.36f;
+        const float direction = (ball % 2U == 0U) ? 1.0f : -1.0f;
+        const float bob = std::sin(bob_phase + static_cast<float>(ball) * 0.22f) *
+            bob_amplitude * direction;
+        const float ball_y = center_y + bob;
+        const float draw_radius = radius;
+        const BYTE opacity = 255;
+
+        draw_glow_band(
+            graphics,
+            center_x,
+            ball_y,
+            draw_radius,
+            2.42f,
+            1.72f,
+            14U,
+            255,
+            92,
+            8,
+            11.0f * emission);
+        draw_glow_band(
+            graphics,
+            center_x,
+            ball_y,
+            draw_radius,
+            1.98f,
+            1.34f,
+            12U,
+            255,
+            150,
+            20,
+            14.0f * emission);
+        draw_glow_band(
+            graphics,
+            center_x,
+            ball_y,
+            draw_radius,
+            1.56f,
+            1.04f,
+            10U,
+            255,
+            226,
+            92,
+            17.0f * emission);
 
         const Gdiplus::RectF outer_rect(
             center_x - draw_radius,
             ball_y - draw_radius,
             draw_radius * 2.0f,
             draw_radius * 2.0f);
-        Gdiplus::SolidBrush outer(Gdiplus::Color(255, 225, 72, 7));
+        Gdiplus::SolidBrush outer(Gdiplus::Color(opacity, 228, 80, 8));
         graphics.FillEllipse(&outer, outer_rect);
 
         const Gdiplus::RectF inner_rect(
-            center_x - draw_radius * 0.84f,
-            ball_y - draw_radius * 0.84f,
-            draw_radius * 1.68f,
-            draw_radius * 1.68f);
-        Gdiplus::SolidBrush inner(Gdiplus::Color(255, 255, 158, 23));
+            center_x - draw_radius * 0.83f,
+            ball_y - draw_radius * 0.83f,
+            draw_radius * 1.66f,
+            draw_radius * 1.66f);
+        Gdiplus::SolidBrush inner(Gdiplus::Color(opacity, 255, 176, 30));
         graphics.FillEllipse(&inner, inner_rect);
 
-        Gdiplus::SolidBrush shine(Gdiplus::Color(205, 255, 237, 178));
+        const Gdiplus::RectF core_rect(
+            center_x - draw_radius * 0.58f,
+            ball_y - draw_radius * 0.58f,
+            draw_radius * 1.16f,
+            draw_radius * 1.16f);
+        Gdiplus::SolidBrush core(Gdiplus::Color(
+            static_cast<BYTE>(72 + shimmer * 54.0f),
+            255,
+            235,
+            118));
+        graphics.FillEllipse(&core, core_rect);
+
+        Gdiplus::SolidBrush shine(Gdiplus::Color(
+            static_cast<BYTE>(205 + shimmer * 38.0f),
+            255,
+            245,
+            193));
         graphics.FillEllipse(
             &shine,
             Gdiplus::RectF(
-                center_x - draw_radius * 0.48f,
-                ball_y - draw_radius * 0.59f,
-                draw_radius * 0.55f,
-                draw_radius * 0.33f));
+                center_x - draw_radius * 0.49f,
+                ball_y - draw_radius * 0.61f,
+                draw_radius * 0.58f,
+                draw_radius * 0.35f));
 
-        Gdiplus::Pen edge(Gdiplus::Color(255, 255, 205, 76), 1.2f);
+        Gdiplus::Pen edge(Gdiplus::Color(opacity, 255, 208, 80), 1.2f);
         graphics.DrawEllipse(&edge, outer_rect);
 
         const float star_spacing = draw_radius * 0.30f;
-        const float star_outer = std::max(1.2f, draw_radius * 0.105f);
-        Gdiplus::SolidBrush star_brush(Gdiplus::Color(255, 198, 25, 10));
+        const float star_outer = std::max(1.25f, draw_radius * 0.105f);
+        Gdiplus::SolidBrush star_brush(Gdiplus::Color(opacity, 198, 25, 10));
         for (const auto& star : dragon_ball_star_positions(
                  ball + 1U, center_x, ball_y, star_spacing)) {
             Gdiplus::GraphicsPath path;
@@ -1300,6 +1991,51 @@ void draw_dragon_balls(HDC device, const RECT&) {
         }
     }
 }
+
+void draw_main_header(HDC device, const RECT& client) {
+    RECT header{0, 0, client.right, header_height};
+    FillRect(device, &header, application.header_brush);
+    draw_header_banner(device);
+    draw_dragon_balls(device, client);
+
+    RECT accent{0, header_height - 4, client.right, header_height - 1};
+    FillRect(device, &accent, application.accent_brush);
+
+    RECT blue_undertone{0, header_height - 1, client.right, header_height};
+    HBRUSH blue_brush = CreateSolidBrush(RGB(36, 183, 232));
+    FillRect(device, &blue_undertone, blue_brush);
+    DeleteObject(blue_brush);
+}
+
+void redraw_animated_header(HWND window) {
+    RECT client{};
+    GetClientRect(window, &client);
+    const int width = std::max(1, static_cast<int>(client.right - client.left));
+    const int height = std::max(1, header_height);
+
+    HDC device = GetDC(window);
+    if (!device) return;
+
+    HDC memory_device = CreateCompatibleDC(device);
+    HBITMAP frame = CreateCompatibleBitmap(device, width, height);
+    if (!memory_device || !frame) {
+        if (frame) DeleteObject(frame);
+        if (memory_device) DeleteDC(memory_device);
+        ReleaseDC(window, device);
+        return;
+    }
+
+    HGDIOBJ old_bitmap = SelectObject(memory_device, frame);
+    RECT frame_client{0, 0, width, height};
+    draw_main_header(memory_device, frame_client);
+    BitBlt(device, 0, 0, width, height, memory_device, 0, 0, SRCCOPY);
+
+    SelectObject(memory_device, old_bitmap);
+    DeleteObject(frame);
+    DeleteDC(memory_device);
+    ReleaseDC(window, device);
+}
+
 
 void draw_screen_bezel(HDC device, HWND control) {
     if (!control || !IsWindowVisible(control)) return;
@@ -1330,18 +2066,31 @@ LRESULT CALLBACK window_procedure(
         create_menu(window);
         create_controls();
         DragAcceptFiles(window, TRUE);
-        SetTimer(window, dragon_ball_timer_id, 100, nullptr);
+        SetTimer(window, dragon_ball_timer_id, 33, nullptr);
         return 0;
-    case WM_SIZE:
+    case WM_SIZE: {
         layout_controls(LOWORD(lparam), HIWORD(lparam));
+        RECT client{};
+        GetClientRect(window, &client);
+        RECT header{0, 0, client.right, header_height};
+        RedrawWindow(
+            window,
+            &header,
+            nullptr,
+            RDW_INVALIDATE | RDW_ALLCHILDREN);
         return 0;
+    }
     case WM_TIMER:
         if (wparam == dragon_ball_timer_id) {
             ++dragon_ball_tick;
-            RECT client{};
-            GetClientRect(window, &client);
-            RECT header = {0, 0, client.right, header_height};
-            InvalidateRect(window, &header, FALSE);
+            if (application.audio_rendering) {
+                ++audio_progress_poll_tick;
+                if (audio_progress_poll_tick >= 30U) {
+                    audio_progress_poll_tick = 0;
+                    poll_audio_progress();
+                }
+            }
+            redraw_animated_header(window);
             return 0;
         }
         break;
@@ -1387,6 +2136,11 @@ LRESULT CALLBACK window_procedure(
     }
     case WM_DROPFILES: {
         const HDROP drop = reinterpret_cast<HDROP>(wparam);
+        if (application.running || application.audio_rendering) {
+            DragFinish(drop);
+            show_error(L"Wait for the current extraction to finish before loading another ROM.");
+            return 0;
+        }
         std::vector<wchar_t> path(32768, L'\0');
         if (DragQueryFileW(
                 drop, 0, path.data(), static_cast<UINT>(path.size())) > 0) {
@@ -1399,6 +2153,7 @@ LRESULT CALLBACK window_procedure(
         std::unique_ptr<std::wstring> output(
             reinterpret_cast<std::wstring*>(lparam));
         set_running(false);
+        set_audio_rendering(true);
         populate_results(*output);
         if (std::filesystem::is_regular_file(
                 std::filesystem::path(*output) / L"graphics" /
@@ -1413,13 +2168,35 @@ LRESULT CALLBACK window_procedure(
         }
         SetWindowTextW(
             application.status,
-            L"Analysis finished. Select an asset to preview it here.");
+            L"Graphics are ready. Full WAV tracks and SFX are rendering in the background...");
+        return 0;
+    }
+    case message_soundtrack_finished: {
+        std::unique_ptr<std::wstring> output(
+            reinterpret_cast<std::wstring*>(lparam));
+        set_audio_rendering(false);
+        populate_results(*output);
+        SetWindowTextW(application.status, L"Full extraction finished.");
+        return 0;
+    }
+    case message_soundtrack_failed: {
+        std::unique_ptr<std::wstring> error(
+            reinterpret_cast<std::wstring*>(lparam));
+        set_audio_rendering(false);
+        populate_results(selected_output_directory());
+        SetWindowTextW(
+            application.status,
+            L"Graphics are ready, but audio extraction failed.");
+        std::wstring error_message(L"Audio extraction failed:\r\n\r\n");
+        error_message.append(*error);
+        show_error(error_message);
         return 0;
     }
     case message_analysis_failed: {
         std::unique_ptr<std::wstring> error(
             reinterpret_cast<std::wstring*>(lparam));
         set_running(false);
+        set_audio_rendering(false);
         SetWindowTextW(application.status, L"Analysis failed.");
         show_error(*error);
         return 0;
@@ -1486,16 +2263,7 @@ LRESULT CALLBACK window_procedure(
         HDC device = reinterpret_cast<HDC>(wparam);
         FillRect(device, &client, application.background_brush);
 
-        RECT header = {0, 0, client.right, header_height};
-        FillRect(device, &header, application.header_brush);
-        draw_dragon_balls(device, client);
-        RECT accent = {0, header_height - 4, client.right, header_height - 1};
-        FillRect(device, &accent, application.accent_brush);
-        RECT blue_undertone = {
-            0, header_height - 1, client.right, header_height};
-        HBRUSH blue_brush = CreateSolidBrush(RGB(36, 183, 232));
-        FillRect(device, &blue_undertone, blue_brush);
-        DeleteObject(blue_brush);
+        draw_main_header(device, client);
 
         RECT setup_panel = {
             content_margin,
@@ -1522,7 +2290,7 @@ LRESULT CALLBACK window_procedure(
         return 1;
     }
     case WM_CLOSE:
-        if (application.running) {
+        if (application.running || application.audio_rendering) {
             const int answer = MessageBoxW(
                 window,
                 L"An analysis is still running. Exit DragonByteZ anyway?",
@@ -1533,6 +2301,7 @@ LRESULT CALLBACK window_procedure(
         return 0;
     case WM_DESTROY:
         KillTimer(window, dragon_ball_timer_id);
+        close_preview_audio();
         PlaySoundW(nullptr, nullptr, 0);
         application.preview_bitmap.reset();
         DeleteObject(application.normal_font);

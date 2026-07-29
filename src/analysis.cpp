@@ -327,12 +327,23 @@ void write_binary(
     }
 }
 
+void write_audio_progress(
+    const std::filesystem::path& soundtrack_directory,
+    const std::string& message) {
+    std::filesystem::create_directories(soundtrack_directory);
+    std::ofstream progress(soundtrack_directory / ".audio_progress.txt");
+    progress << message << '\n';
+}
+
 void write_level_music(
     const Rom& rom,
     const GameProfile& profile,
     const std::filesystem::path& output) {
-    constexpr unsigned track_seconds = 12;
-    constexpr const char* cache_version = "DragonByteZ-0.6.18-12-second-WAV-preview";
+    constexpr unsigned maximum_track_seconds = 480;
+    constexpr unsigned loop_count = 2;
+    constexpr unsigned fade_seconds = 5;
+    constexpr const char* cache_version =
+        "DragonByteZ-0.7.6-declicked-interpolated-full-WAV";
 
     std::filesystem::create_directories(output);
     const std::filesystem::path marker = output / ".music_cache_version";
@@ -354,35 +365,92 @@ void write_level_music(
     }
 
     std::ofstream csv(output / "level_music.csv");
-    csv << "track,record_offset,duration_seconds,wav,status\n";
+    csv << "track,record_offset,duration_seconds,loop_detected,"
+           "loop_start_seconds,loop_length_seconds,natural_end,wav,status\n";
     std::ofstream playlist(output / "DragonByteZ_tracks.m3u");
+    const std::filesystem::path progress_directory = output.parent_path();
+
     for (std::size_t index = 0; index < profile.bgm_count; ++index) {
+        write_audio_progress(
+            progress_directory,
+            "Rendering full track " + std::to_string(index + 1U) + " of " +
+                std::to_string(profile.bgm_count) + "...");
+
         const std::size_t record = profile.bgm_table + index * 20U;
         const std::string wav_name = numbered_name("track_", index, ".wav");
         const std::filesystem::path wav_path = output / "tracks" / wav_name;
         bool reused = false;
+        bool rendered = false;
+        BgmRenderResult render_result;
         std::error_code error;
+        std::string failure;
+
         if (std::filesystem::is_regular_file(wav_path, error) &&
-            !error && std::filesystem::file_size(wav_path, error) > 44U && !error) {
+            !error && std::filesystem::file_size(wav_path, error) > 44U &&
+            !error) {
             reused = true;
         } else {
-            render_bgm_preview_wav(rom, index, wav_path, track_seconds);
+            try {
+                render_result = render_bgm_full_wav(
+                    rom,
+                    index,
+                    wav_path,
+                    maximum_track_seconds,
+                    loop_count,
+                    fade_seconds);
+                rendered = true;
+            } catch (const std::exception& render_error) {
+                failure = render_error.what();
+                std::filesystem::remove(wav_path, error);
+            }
         }
-        csv << index << ',' << hex(record, 7) << ',' << track_seconds << ','
-            << wav_name << ',' << (reused ? "cached" : "rendered") << '\n';
-        playlist << "tracks/" << wav_name << '\n';
+
+        csv << index << ',' << hex(record, 7) << ',';
+        if (reused) {
+            csv << "cached,cached,cached,cached,cached,";
+        } else if (rendered) {
+            csv << render_result.duration_seconds << ','
+                << (render_result.loop_detected ? 1 : 0) << ','
+                << render_result.loop_start_seconds << ','
+                << render_result.loop_length_seconds << ','
+                << (render_result.natural_end_detected ? 1 : 0) << ',';
+        } else {
+            csv << "failed,failed,failed,failed,failed,";
+        }
+
+        csv << wav_name << ',';
+        if (reused) {
+            csv << "cached";
+        } else if (rendered) {
+            csv << "rendered";
+        } else {
+            csv << "failed: " << failure;
+        }
+        csv << '\n';
+
+        if (reused || rendered) {
+            playlist << "tracks/" << wav_name << '\n';
+        }
     }
 
+    write_audio_progress(progress_directory, "Full track rendering complete.");
+
     std::ofstream note(output / "README.txt");
-    note << "DragonByteZ Webfoot music export\n"
-         << "================================\n\n"
+    note << "DragonByteZ Webfoot full music export\n"
+         << "====================================\n\n"
          << "Rendered " << profile.bgm_count
-         << " distinct original-engine selections as immediately playable "
-            "44.1 kHz stereo WAV previews. Batch analysis uses twelve seconds "
-            "per track so analyzing a ROM does not spend many minutes emulating "
-            "hours of audio. Existing valid WAV previews are reused on later "
-            "runs. No BIN, GSF, miniGSF or sequence files are written.\n";
+         << " original-engine selections as playable 44.1 kHz stereo WAV "
+            "files. For looping music, DragonByteZ preserves the introduction "
+            "and two detected loops, then applies a five-second fade. "
+            "Non-looping music ends at detected silence. If neither condition "
+            "can be identified, the safety fallback is "
+         << maximum_track_seconds
+         << " seconds. Existing valid full WAV files are reused. Failed or "
+            "stalled records are logged and skipped instead of stopping the "
+            "remaining soundtrack. No BIN, GSF or miniGSF output is required "
+            "for playback.\n";
 }
+
 
 struct MapLayer {
     std::vector<Rgba> pixels;
@@ -1616,21 +1684,32 @@ bool read_log1_audio_record(
            record.raw_size <= rom.size() - sample_offset;
 }
 
-[[maybe_unused]] void write_log1_audio_candidates(
+void write_discovered_pcm_banks(
     const Rom& rom,
     const std::filesystem::path& output) {
-    std::filesystem::remove_all(output / "candidate_samples");
-    std::filesystem::create_directories(output / "candidate_samples");
-    std::ofstream runs_csv(output / "audio_candidate_runs.csv");
-    runs_csv << "run,table_offset,record_count,first_sample_pointer,"
-                "last_sample_pointer\n";
-    std::ofstream samples_csv(output / "audio_candidate_samples.csv");
-    samples_csv << "run,record,record_offset,pointer,file_offset,flags,"
-                   "loop_start,raw_size,sample_rate,wav\n";
+    std::filesystem::remove_all(output / "instrument_samples");
+    std::filesystem::remove_all(output / "sfx_samples");
+    std::filesystem::create_directories(output / "instrument_samples");
+    std::filesystem::create_directories(output / "sfx_samples");
+
+    std::ofstream banks_csv(output / "pcm_banks.csv");
+    banks_csv << "bank,table_offset,classification,record_count,looped_records,"
+                 "first_sample_pointer,last_sample_pointer\n";
+    std::ofstream instruments_csv(output / "instrument_samples.csv");
+    instruments_csv << "bank,record,record_offset,pointer,file_offset,flags,"
+                       "loop_start,raw_size,sample_rate,duration_seconds,wav\n";
+    std::ofstream sfx_csv(output / "sfx_samples.csv");
+    sfx_csv << "bank,record,record_offset,pointer,file_offset,flags,"
+               "loop_start,raw_size,sample_rate,duration_seconds,wav\n";
 
     std::map<std::tuple<std::uint32_t, std::uint16_t, std::uint16_t>,
-             std::string> exported;
-    std::size_t run_index = 0;
+             std::string> exported_instruments;
+    std::map<std::tuple<std::uint32_t, std::uint16_t, std::uint16_t>,
+             std::string> exported_sfx;
+    std::size_t bank_index = 0;
+    std::size_t instrument_index = 0;
+    std::size_t sfx_index = 0;
+
     for (std::size_t offset = 0; offset + 12 <= rom.size(); offset += 4) {
         Log1AudioRecord first;
         if (!read_log1_audio_record(rom, offset, first)) continue;
@@ -1641,60 +1720,87 @@ bool read_log1_audio_record(
 
         std::vector<Log1AudioRecord> run;
         for (std::size_t record_offset = offset;
-             record_offset + 12 <= rom.size(); record_offset += 12) {
+             record_offset + 12 <= rom.size();
+             record_offset += 12) {
             Log1AudioRecord record;
             if (!read_log1_audio_record(rom, record_offset, record)) break;
             run.push_back(record);
         }
-        if (run.size() < 3) continue;
+        if (run.size() < 3U) continue;
 
-        runs_csv << run_index << ',' << hex(offset, 7) << ',' << run.size()
-                 << ',' << hex(run.front().pointer) << ','
-                 << hex(run.back().pointer) << '\n';
+        const std::size_t looped_records = static_cast<std::size_t>(
+            std::count_if(
+                run.begin(), run.end(),
+                [](const Log1AudioRecord& record) {
+                    return record.loop_start != 0U;
+                }));
+        const bool instrument_bank =
+            looped_records * 4U >= run.size();
+        const char* classification =
+            instrument_bank ? "instrument" : "sound effect";
+        banks_csv << bank_index << ',' << hex(offset, 7) << ','
+                  << classification << ',' << run.size() << ','
+                  << looped_records << ',' << hex(run.front().pointer) << ','
+                  << hex(run.back().pointer) << '\n';
+
+        auto& exported = instrument_bank
+            ? exported_instruments
+            : exported_sfx;
+        std::ofstream& csv = instrument_bank
+            ? instruments_csv
+            : sfx_csv;
+        std::size_t& output_index = instrument_bank
+            ? instrument_index
+            : sfx_index;
+        const std::filesystem::path folder = output /
+            (instrument_bank ? "instrument_samples" : "sfx_samples");
+        const char* prefix = instrument_bank ? "instrument_" : "sfx_";
+
         for (std::size_t record_index = 0;
-             record_index < run.size(); ++record_index) {
-            const auto& record = run[record_index];
+             record_index < run.size();
+             ++record_index) {
+            const Log1AudioRecord& record = run[record_index];
             const auto key = std::make_tuple(
                 record.pointer, record.raw_size, record.sample_rate);
             auto exported_item = exported.find(key);
             if (exported_item == exported.end()) {
                 std::ostringstream filename;
-                filename << "sample_" << std::setw(3) << std::setfill('0')
-                         << exported.size() << '_' << record.sample_rate
+                filename << prefix << std::setw(3) << std::setfill('0')
+                         << output_index++ << '_' << record.sample_rate
                          << "hz.wav";
                 const std::string name = filename.str();
                 write_wav(
-                    output / "candidate_samples" / name,
+                    folder / name,
                     rom.slice(
                         rom.pointer_to_offset(record.pointer),
                         record.raw_size),
                     record.sample_rate);
                 exported_item = exported.emplace(key, name).first;
             }
-            samples_csv << run_index << ',' << record_index << ','
-                        << hex(record.offset, 7) << ','
-                        << hex(record.pointer) << ','
-                        << hex(rom.pointer_to_offset(record.pointer), 7) << ','
-                        << record.flags << ',' << record.loop_start << ','
-                        << record.raw_size << ',' << record.sample_rate << ','
-                        << exported_item->second << '\n';
+            const double duration =
+                static_cast<double>(record.raw_size) /
+                static_cast<double>(record.sample_rate);
+            csv << bank_index << ',' << record_index << ','
+                << hex(record.offset, 7) << ',' << hex(record.pointer) << ','
+                << hex(rom.pointer_to_offset(record.pointer), 7) << ','
+                << record.flags << ',' << record.loop_start << ','
+                << record.raw_size << ',' << record.sample_rate << ','
+                << duration << ',' << exported_item->second << '\n';
         }
-        ++run_index;
+        ++bank_index;
         offset += run.size() * 12U - 4U;
     }
 
-    std::ofstream note(output / "LOG1_soundtrack_notes.txt");
-    note << "DragonByteZ LOG1 experimental soundtrack scan\n"
-         << "=============================================\n\n"
-         << "The Legacy of Goku uses a different data layout from LOG2. "
-            "DragonByteZ does not reuse LOG2's hard-coded sample or BGM "
-            "tables. Instead, it locates contiguous candidate runs of "
-            "12-byte records containing a ROM pointer, flags, loop point, "
-            "sample byte length and plausible sample rate. Only runs with "
-            "at least three consecutive valid records are exported.\n"
-         << "The WAV files are candidate instrument/effect samples, not "
-            "claims that complete songs are raw PCM. Full LOG1 sequence and "
-            "song-table semantics remain under reconstruction.\n";
+    std::ofstream note(output / "PCM_BANKS_README.txt");
+    note << "DragonByteZ discovered Webfoot PCM banks\n"
+         << "========================================\n\n"
+         << "DragonByteZ scans for contiguous 12-byte Webfoot sample records "
+            "containing a ROM pointer, flags, loop start, byte length and "
+            "sample rate. Banks with at least one looped record per four "
+            "records are exported as instrument banks; the remaining banks "
+            "are exported as sound effects. Every WAV contains the complete "
+            "recorded PCM sample, not a shortened preview. Source offsets and "
+            "classification evidence are preserved in the CSV files.\n";
 }
 
 
@@ -1876,13 +1982,26 @@ std::string log1_level_summary(const Rom& rom) {
 void analyze_log1_graphics(
     const Rom& rom,
     const std::filesystem::path& output) {
+    std::filesystem::create_directories(output);
+    try {
+        const GameProfile profile = discover_log1_webfoot_profile(rom);
+        analyze_webfoot_graphics(rom, profile, output);
+    } catch (const std::exception& error) {
+        std::ofstream status(output / "LOG1_static_map_discovery_status.txt");
+        status << "Static LOG1 map-table discovery did not produce a complete "
+                  "Webfoot map profile for this ROM. Runtime OBJ sprites and "
+                  "VRAM background tilesets are still exported.\n\n"
+               << error.what() << '\n';
+    }
     export_log1_runtime_graphics(rom, output);
 }
 
 void analyze_log1_soundtrack(
     const Rom& rom,
     const std::filesystem::path& output) {
-    export_log1_runtime_soundtrack(rom, output, 12);
+    std::filesystem::create_directories(output);
+    write_discovered_pcm_banks(rom, output);
+    export_log1_runtime_soundtrack(rom, output / "level_music", 480);
 }
 
 void analyze_log1_all(
@@ -1892,7 +2011,7 @@ void analyze_log1_all(
     analyze_log1_graphics(rom, output / "graphics");
     analyze_log1_soundtrack(rom, output / "soundtrack");
     std::ofstream report(output / "DragonByteZ_report.txt");
-    report << "DragonByteZ 0.6.23 Legacy of Goku analysis report\n"
+    report << "DragonByteZ 0.7.0 Legacy of Goku analysis report\n"
            << "================================================\n\n"
            << "ROM title: " << rom.title() << '\n'
            << "Game code: " << rom.game_code() << '\n'
@@ -1903,7 +2022,7 @@ void analyze_log1_all(
               "hidden Sprite Viewer. The old Go To Map viewport screenshots "
               "were removed because they were not complete level layers. "
               "Music is selected through the hidden Play Music sound test and "
-              "written only as stereo WAV previews.\n";
+              "written as full stereo WAV tracks with loop detection and a five-second fade.\n";
 }
 
 } // namespace
@@ -2128,6 +2247,30 @@ void analyze_webfoot_graphics(
         atlas_columns * (atlas_width + atlas_padding * 2),
         atlas_rows * (atlas_height + atlas_padding * 2),
         contact);
+
+    std::ofstream tileset_gallery(output / "tileset_gallery.html");
+    tileset_gallery
+        << "<!doctype html><meta charset=\"utf-8\"><title>"
+        << html_text(game_family_name(game_family(rom)))
+        << " tilesets</title><style>"
+           "body{background:#171b20;color:#eef3f8;font:14px Segoe UI,Arial;margin:0}"
+           "header{position:sticky;top:0;background:#11151a;padding:16px;border-bottom:3px solid #f47d1f;z-index:2}"
+           "main{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px;padding:16px}"
+           "article{background:#272d34;border:1px solid #59636e;border-radius:12px;padding:10px}"
+           "img{display:block;width:192px;height:192px;max-width:100%;margin:auto;image-rendering:pixelated;background:#0c0f12}"
+           "b{display:block;margin-bottom:8px}</style><header><h1>"
+        << html_text(game_family_name(game_family(rom)))
+        << " decoded tilesets</h1><p>Every verified 4bpp or 8bpp GBA tile atlas, rendered from ROM data with the selected game palette.</p></header><main>";
+    for (std::size_t index = 0;
+         index < profile.level_tileset_count;
+         ++index) {
+        const std::string filename = numbered_name("tileset_", index, ".png");
+        tileset_gallery << "<article><b>Tileset " << index
+                        << "</b><a href=\"level_tilesets/" << filename
+                        << "\"><img loading=\"lazy\" src=\"level_tilesets/"
+                        << filename << "\"></a></article>";
+    }
+    tileset_gallery << "</main>";
 
     const std::size_t opening_index = opening_record_index(level_index);
     std::ofstream map_csv(output / "level_preview_layers.csv");
@@ -2373,6 +2516,7 @@ void analyze_log2_soundtrack(const Rom& rom, const std::filesystem::path& output
     std::filesystem::create_directories(output);
     std::filesystem::create_directories(output / "instrument_samples");
     std::filesystem::create_directories(output / "sfx_samples");
+    write_audio_progress(output, "Extracting instrument samples...");
 
     std::ofstream instruments(output / "instrument_samples.csv");
     instruments << "index,pointer,file_offset,flags,loop_start,raw_size,"
@@ -2407,6 +2551,7 @@ void analyze_log2_soundtrack(const Rom& rom, const std::filesystem::path& output
                     << '\n';
     }
 
+    write_audio_progress(output, "Extracting sound effects...");
     std::ofstream sfx(output / "sfx_samples.csv");
     sfx << "index,pointer,file_offset,loop_start,flags,raw_size,sample_rate,wav\n";
     for (std::size_t index = 0;
@@ -2469,6 +2614,7 @@ void analyze_log2_soundtrack(const Rom& rom, const std::filesystem::path& output
                "signed PCM\"\n";
     }
 
+    write_audio_progress(output, "Preparing full music tracks...");
     write_level_music(rom, profile, output / "level_music");
 
     std::ofstream research(output / "soundtrack_research.csv");
@@ -2487,7 +2633,7 @@ void analyze_log2_soundtrack(const Rom& rom, const std::filesystem::path& output
                 "\"64 raw signed 8-bit PCM effects at their packed rates\"\n"
              << "bgm_table," << hex(profile.bgm_table, 7) << ','
              << profile.name << ",high,verified,"
-                "\"44 custom Webfoot records rendered as cached WAV previews\"\n"
+                "\"44 custom Webfoot records rendered as full cached WAV tracks\"\n"
              << "expected_instrumentation,electric guitar-heavy score,"
              << profile.name << ','
              << "medium,search signature,"
@@ -2500,7 +2646,7 @@ void analyze_log2_soundtrack(const Rom& rom, const std::filesystem::path& output
                 "EU global-state layout\"\n"
              << "audio_export,209 WAV files,"
              << profile.name << ",high,enabled,"
-                "\"101 instrument samples, 64 SFX samples and 44 cached BGM WAV previews\"\n"
+                "\"101 instrument samples, 64 SFX samples and 44 full cached BGM WAV tracks\"\n"
              << "rejected_table,"
              << hex(profile.rejected_indexed_graphics_table, 7) << ','
              << profile.name << ",high,reclassified,"
@@ -2532,7 +2678,7 @@ void analyze_log2_soundtrack(const Rom& rom, const std::filesystem::path& output
             "rejected and is never turned into WAV data.\n"
          << "* The verified 44-record BGM table at "
          << hex(profile.bgm_table, 7)
-         << " is rendered as cached twelve-second stereo WAV previews. "
+         << " is rendered as full cached stereo WAV tracks with detected loops, natural endings, and a five-second fade. "
             "No sequence BIN, GSF or miniGSF files are written.\n"
          << "* 0x030026DC is retained only as a medium-confidence runtime "
             "current-song lead. It still needs European control-flow proof.\n"
@@ -2550,6 +2696,9 @@ void analyze_buus_fury_soundtrack(
     }
     std::filesystem::create_directories(output);
     const auto& profile = profile_for(rom);
+    write_audio_progress(output, "Extracting instruments and sound effects...");
+    write_discovered_pcm_banks(rom, output);
+    write_audio_progress(output, "Preparing full music tracks...");
     write_level_music(rom, profile, output / "level_music");
 
     std::ofstream note(output / "BUUS_FURY_soundtrack_notes.txt");
@@ -2560,7 +2709,7 @@ void analyze_buus_fury_soundtrack(
          << "Title-screen patch record: "
          << hex(profile.title_bgm_record, 7) << "\n\n"
          << "level_music contains all recovered BGM entries as distinct, "
-            "cached twelve-second stereo WAV previews. The startup patch uses "
+            "full cached stereo WAV tracks. The startup patch uses "
             "the verified title record at 0x003BBB10. No sequence BIN, GSF, "
             "miniGSF or candidate sample files are written.\n";
 }
@@ -2574,7 +2723,7 @@ void analyze_buus_fury_all(
     const auto& profile = profile_for(rom);
     const auto level_index = build_level_index(rom, profile);
     std::ofstream report(output / "DragonByteZ_report.txt");
-    report << "DragonByteZ 0.6.23 Buu's Fury analysis report\n"
+    report << "DragonByteZ 0.7.0 Buu's Fury analysis report\n"
            << "===========================================\n\n"
            << "ROM title: " << rom.title() << '\n'
            << "Game code: " << rom.game_code() << '\n'
@@ -2593,10 +2742,10 @@ void analyze_buus_fury_all(
            << hex(profile.default_bg_palette, 7) << " and object palette at "
            << hex(profile.default_obj_palette, 7) << '\n'
            << "- " << profile.bgm_count
-           << " distinct cached Webfoot BGM WAV previews\n\n"
+           << " distinct full cached Webfoot BGM WAV tracks\n\n"
            << "Open research:\n"
            << "- assign localized area names to map entries\n"
-           << "- identify character and sprite animation tables\n";
+           << "- assign descriptive names to recovered character and animation records\n";
 }
 
 void analyze_log2_all(const Rom& rom, const std::filesystem::path& output) {
@@ -2606,7 +2755,7 @@ void analyze_log2_all(const Rom& rom, const std::filesystem::path& output) {
     analyze_log2_graphics(rom, output / "graphics");
     analyze_log2_soundtrack(rom, output / "soundtrack");
     std::ofstream report(output / "DragonByteZ_report.txt");
-    report << "DragonByteZ 0.6.23 LOG2 analysis report\n"
+    report << "DragonByteZ 0.7.0 LOG2 analysis report\n"
            << "=================================\n\n"
            << "ROM title: " << rom.title() << '\n'
            << "Game code: " << rom.game_code() << '\n'
@@ -2627,11 +2776,11 @@ void analyze_log2_all(const Rom& rom, const std::filesystem::path& output) {
            << "- 22 character-display metadata records\n"
            << "- 101 music instrument WAV samples at recorded sample rates\n"
            << "- 64 sound-effect WAV samples at their recorded rates\n"
-           << "- 44 distinct cached level-music WAV previews; no BIN, GSF or miniGSF output\n"
+           << "- 44 full cached level-music WAV tracks with loop detection and five-second fades; no BIN, GSF or miniGSF output\n"
            << "- false 0x006A981C PCM table rejected as indexed graphics\n\n"
            << "Open research:\n"
            << "- confirm layer priority and scene-specific palette effects\n"
-           << "- assemble individual overworld character animation frames\n"
+           << "- assign descriptive names to the recovered sprite and animation tables\n"
            << "- assign descriptive names to the 44 verified BGM records\n";
 }
 

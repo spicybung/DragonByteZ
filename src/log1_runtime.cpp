@@ -1,5 +1,6 @@
 #include "dragonbytez/log1_runtime.hpp"
 
+#include "dragonbytez/gsf_player.hpp"
 #include "dragonbytez/png.hpp"
 #include "dragonbytez/rom.hpp"
 
@@ -74,8 +75,8 @@ public:
     explicit Log1RuntimeSession(const Rom& rom) {
         system_.cpuIsMultiBoot = false;
         system_.soundSampleRate = audio_sample_rate;
-        system_.soundDeclicking = false;
-        system_.soundInterpolation = false;
+        system_.soundDeclicking = true;
+        system_.soundInterpolation = true;
         if (CPULoadRom(
                 &system_,
                 rom.bytes().data(),
@@ -109,8 +110,20 @@ public:
         for (unsigned frame = 0; frame < count; ++frame) {
             set_keys(keys);
             const int target = system_.frameCount + 1;
+            unsigned stalled_iterations = 0;
+            int previous_frame_count = system_.frameCount;
             while (system_.frameCount < target) {
                 CPULoop(&system_, 200000);
+                if (system_.frameCount == previous_frame_count) {
+                    ++stalled_iterations;
+                    if (stalled_iterations >= 2000U) {
+                        throw std::runtime_error(
+                            "the LOG1 runtime stopped advancing frames");
+                    }
+                } else {
+                    previous_frame_count = system_.frameCount;
+                    stalled_iterations = 0;
+                }
             }
         }
     }
@@ -299,6 +312,7 @@ void render_objects(
         }
     }
 }
+
 
 struct RuntimeSpriteFrame {
     unsigned width = 0;
@@ -541,6 +555,285 @@ void write_stereo_wav(
     if (!output) throw std::runtime_error("cannot finish LOG1 track WAV");
 }
 
+
+struct RuntimeTilesetRecord {
+    std::size_t map_index = 0;
+    unsigned background = 0;
+    unsigned mode = 0;
+    bool colour_256 = false;
+    unsigned character_base = 0;
+    unsigned screen_base = 0;
+    unsigned tile_count = 0;
+    unsigned referenced_tiles = 0;
+    std::string filename;
+};
+
+std::pair<unsigned, unsigned> text_background_dimensions(std::uint16_t control) {
+    switch ((control >> 14U) & 3U) {
+    case 0U: return {32U, 32U};
+    case 1U: return {64U, 32U};
+    case 2U: return {32U, 64U};
+    default: return {64U, 64U};
+    }
+}
+
+std::size_t text_screen_entry_offset(
+    unsigned screen_base,
+    unsigned width_tiles,
+    unsigned x,
+    unsigned y) {
+    const unsigned block_x = x / 32U;
+    const unsigned block_y = y / 32U;
+    const unsigned blocks_per_row = width_tiles / 32U;
+    const unsigned block = block_y * blocks_per_row + block_x;
+    return static_cast<std::size_t>(screen_base) +
+        static_cast<std::size_t>(block) * 0x800U +
+        static_cast<std::size_t>((y & 31U) * 32U + (x & 31U)) * 2U;
+}
+
+bool is_text_background(unsigned mode, unsigned background) {
+    if (mode == 0U) return background < 4U;
+    if (mode == 1U) return background < 2U;
+    return false;
+}
+
+bool is_affine_background(unsigned mode, unsigned background) {
+    if (mode == 1U) return background == 2U;
+    if (mode == 2U) return background == 2U || background == 3U;
+    return false;
+}
+
+std::string tileset_signature(
+    const std::vector<Rgba>& pixels,
+    unsigned width,
+    unsigned height) {
+    std::string signature;
+    signature.reserve(8U + pixels.size() * 4U);
+    const auto append_u32 = [&](std::uint32_t value) {
+        signature.push_back(static_cast<char>(value));
+        signature.push_back(static_cast<char>(value >> 8U));
+        signature.push_back(static_cast<char>(value >> 16U));
+        signature.push_back(static_cast<char>(value >> 24U));
+    };
+    append_u32(width);
+    append_u32(height);
+    for (const Rgba& pixel : pixels) {
+        signature.push_back(static_cast<char>(pixel.r));
+        signature.push_back(static_cast<char>(pixel.g));
+        signature.push_back(static_cast<char>(pixel.b));
+        signature.push_back(static_cast<char>(pixel.a));
+    }
+    return signature;
+}
+
+bool capture_runtime_background_tileset(
+    const GBASystem& system,
+    std::size_t map_index,
+    unsigned background,
+    const std::filesystem::path& folder,
+    RuntimeTilesetRecord& record,
+    std::vector<Rgba>& pixels,
+    unsigned& atlas_width,
+    unsigned& atlas_height) {
+    const unsigned mode = system.DISPCNT & 7U;
+    if ((system.DISPCNT & (0x0100U << background)) == 0U) return false;
+    const bool text_background = is_text_background(mode, background);
+    const bool affine_background = is_affine_background(mode, background);
+    if (!text_background && !affine_background) return false;
+
+    const std::uint16_t control = read_u16(system.ioMem, 0x008U + background * 2U);
+    const unsigned character_base = ((control >> 2U) & 3U) * 0x4000U;
+    const unsigned screen_base = ((control >> 8U) & 31U) * 0x800U;
+    const bool colour_256 = affine_background || (control & 0x0080U) != 0U;
+    const unsigned bytes_per_tile = colour_256 ? 64U : 32U;
+    if (character_base >= 0x10000U) return false;
+    const unsigned maximum_by_vram = (0x10000U - character_base) / bytes_per_tile;
+    const unsigned tile_count = std::min(1024U, maximum_by_vram);
+    if (tile_count == 0U) return false;
+
+    std::array<Rgba, 256> palette{};
+    for (std::size_t index = 0; index < palette.size(); ++index) {
+        palette[index] = decode_rgb555(read_u16(system.paletteRAM, index * 2U));
+    }
+    palette[0].a = 0U;
+
+    std::vector<std::array<unsigned, 16>> palette_usage(tile_count);
+    std::vector<unsigned> tile_usage(tile_count, 0U);
+    if (text_background) {
+        const auto dimensions = text_background_dimensions(control);
+        for (unsigned y = 0; y < dimensions.second; ++y) {
+            for (unsigned x = 0; x < dimensions.first; ++x) {
+                const std::size_t entry_offset = text_screen_entry_offset(
+                    screen_base, dimensions.first, x, y);
+                if (entry_offset + 2U > 0x10000U) continue;
+                const std::uint16_t entry = read_u16(system.vram, entry_offset);
+                const unsigned tile = entry & 0x03FFU;
+                if (tile >= tile_count) continue;
+                ++tile_usage[tile];
+                ++palette_usage[tile][(entry >> 12U) & 15U];
+            }
+        }
+    } else {
+        const unsigned dimension_tiles = 16U << ((control >> 14U) & 3U);
+        const std::size_t entry_count = static_cast<std::size_t>(dimension_tiles) * dimension_tiles;
+        for (std::size_t entry_index = 0; entry_index < entry_count; ++entry_index) {
+            const std::size_t entry_offset = static_cast<std::size_t>(screen_base) + entry_index;
+            if (entry_offset >= 0x10000U) break;
+            const unsigned tile = system.vram[entry_offset];
+            if (tile < tile_count) ++tile_usage[tile];
+        }
+    }
+
+    std::vector<unsigned> exported_tile_indices;
+    exported_tile_indices.reserve(tile_count);
+    for (unsigned tile = 0; tile < tile_count; ++tile) {
+        if (tile_usage[tile] != 0U) exported_tile_indices.push_back(tile);
+    }
+    if (exported_tile_indices.empty()) exported_tile_indices.push_back(0U);
+    const unsigned referenced_tiles = static_cast<unsigned>(
+        exported_tile_indices.size());
+    const unsigned exported_tiles = referenced_tiles;
+    const unsigned columns = std::min(32U, std::max(1U, exported_tiles));
+    const unsigned rows = (exported_tiles + columns - 1U) / columns;
+    atlas_width = columns * 8U;
+    atlas_height = rows * 8U;
+    pixels.assign(
+        static_cast<std::size_t>(atlas_width) * atlas_height,
+        Rgba{0, 0, 0, 0});
+
+    for (unsigned destination_tile = 0; destination_tile < exported_tiles;
+         ++destination_tile) {
+        const unsigned tile = exported_tile_indices[destination_tile];
+        unsigned bank = 0U;
+        if (!colour_256) {
+            for (unsigned candidate = 1U; candidate < 16U; ++candidate) {
+                if (palette_usage[tile][candidate] > palette_usage[tile][bank]) {
+                    bank = candidate;
+                }
+            }
+        }
+        const unsigned destination_tile_x = destination_tile % columns;
+        const unsigned destination_tile_y = destination_tile / columns;
+        const std::size_t tile_offset = static_cast<std::size_t>(character_base) +
+            static_cast<std::size_t>(tile) * bytes_per_tile;
+        for (unsigned y = 0; y < 8U; ++y) {
+            for (unsigned x = 0; x < 8U; ++x) {
+                unsigned colour = 0U;
+                if (colour_256) {
+                    colour = system.vram[tile_offset + y * 8U + x];
+                } else {
+                    const std::uint8_t packed =
+                        system.vram[tile_offset + y * 4U + x / 2U];
+                    const unsigned nibble = (x & 1U) != 0U
+                        ? packed >> 4U
+                        : packed & 15U;
+                    colour = bank * 16U + nibble;
+                }
+                Rgba pixel = palette[colour & 255U];
+                if ((colour_256 && colour == 0U) ||
+                    (!colour_256 && (colour & 15U) == 0U)) {
+                    pixel.a = 0U;
+                }
+                const unsigned destination_x = destination_tile_x * 8U + x;
+                const unsigned destination_y = destination_tile_y * 8U + y;
+                pixels[static_cast<std::size_t>(destination_y) * atlas_width + destination_x] = pixel;
+            }
+        }
+    }
+
+    record.map_index = map_index;
+    record.background = background;
+    record.mode = mode;
+    record.colour_256 = colour_256;
+    record.character_base = character_base;
+    record.screen_base = screen_base;
+    record.tile_count = exported_tiles;
+    record.referenced_tiles = referenced_tiles;
+    std::ostringstream filename;
+    filename << "map_" << std::setw(2) << std::setfill('0') << map_index
+             << "_bg" << background << "_tileset.png";
+    record.filename = filename.str();
+    (void)folder;
+    return true;
+}
+
+void write_runtime_tileset_gallery(
+    const std::filesystem::path& output,
+    const std::vector<RuntimeTilesetRecord>& records) {
+    std::ofstream html(output / "tileset_gallery.html");
+    html << R"HTML(<!doctype html><meta charset="utf-8"><title>Legacy of Goku runtime tilesets</title>
+<style>body{background:#171b20;color:#eef3f8;font:14px Segoe UI,Arial;margin:0}header{position:sticky;top:0;background:#11151a;padding:16px;border-bottom:3px solid #f47d1f;z-index:2}main{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;padding:16px}article{background:#272d34;border:1px solid #59636e;border-radius:12px;padding:10px}img{display:block;width:256px;max-width:100%;height:auto;margin:auto;image-rendering:pixelated;background:repeating-conic-gradient(#20262d 0 25%,#151a1f 0 50%) 50%/16px 16px}.meta{color:#b9c4cf;line-height:1.45}</style><header><h1>Legacy of Goku decoded runtime tilesets</h1><p>Background character data read directly from GBA VRAM with the active RGB555 palette and map palette-bank usage. These are tile atlases, not emulator screenshots.</p></header><main>)HTML";
+    for (const RuntimeTilesetRecord& record : records) {
+        html << "<article><b>Map " << record.map_index << " / BG"
+             << record.background << "</b><a href=\"runtime_tilesets/"
+             << record.filename << "\"><img loading=\"lazy\" src=\"runtime_tilesets/"
+             << record.filename << "\"></a><div class=\"meta\">mode "
+             << record.mode << " &middot; "
+             << (record.colour_256 ? "8bpp" : "4bpp")
+             << " &middot; char base 0x" << std::hex << std::uppercase
+             << record.character_base << " &middot; screen base 0x"
+             << record.screen_base << std::dec << "<br>" << record.tile_count
+             << " exported tiles; " << record.referenced_tiles
+             << " referenced by the active map</div></article>";
+    }
+    html << "</main>";
+}
+
+void export_log1_runtime_tilesets(
+    const Rom& rom,
+    const std::filesystem::path& output) {
+    const std::filesystem::path folder = output / "runtime_tilesets";
+    std::filesystem::remove_all(folder);
+    std::filesystem::create_directories(folder);
+    std::ofstream csv(output / "runtime_tilesets.csv");
+    csv << "map,background,video_mode,bpp,character_base,screen_base,exported_tiles,referenced_tiles,png,status\n";
+
+    std::vector<RuntimeTilesetRecord> records;
+    std::set<std::string> seen_tilesets;
+
+    for (std::size_t map_index = 0; map_index < log1_map_count; ++map_index) {
+        Log1RuntimeSession map_session(rom);
+        map_session.boot_to_debug_menu();
+        for (std::size_t selection = 0; selection < map_index; ++selection) {
+            map_session.press(key_right, 3, 5);
+        }
+        map_session.press(key_a, 8, 30);
+        map_session.run_frames(180U);
+
+        bool captured_any = false;
+        for (unsigned background = 0; background < 4U; ++background) {
+            RuntimeTilesetRecord record;
+            std::vector<Rgba> pixels;
+            unsigned width = 0U;
+            unsigned height = 0U;
+            if (!capture_runtime_background_tileset(
+                    map_session.system(), map_index, background, folder,
+                    record, pixels, width, height)) {
+                continue;
+            }
+            captured_any = true;
+            const std::string signature = tileset_signature(pixels, width, height);
+            if (!seen_tilesets.insert(signature).second) {
+                csv << map_index << ',' << background << ',' << record.mode << ','
+                    << (record.colour_256 ? 8 : 4) << ',' << record.character_base << ','
+                    << record.screen_base << ',' << record.tile_count << ','
+                    << record.referenced_tiles << ",,duplicate tileset\n";
+                continue;
+            }
+            write_png_rgba(folder / record.filename, width, height, pixels);
+            csv << map_index << ',' << background << ',' << record.mode << ','
+                << (record.colour_256 ? 8 : 4) << ',' << record.character_base << ','
+                << record.screen_base << ',' << record.tile_count << ','
+                << record.referenced_tiles << ',' << record.filename << ",decoded from VRAM\n";
+            records.push_back(std::move(record));
+        }
+        if (!captured_any) {
+            csv << map_index << ",,,,,,,,no active text/affine backgrounds after map load\n";
+        }
+    }
+    write_runtime_tileset_gallery(output, records);
+}
+
 std::vector<std::int16_t> fixed_duration_audio(
     const std::vector<std::int16_t>& captured,
     unsigned seconds) {
@@ -571,7 +864,9 @@ void export_log1_runtime_graphics(
     if (!is_log1_rom(rom)) {
         throw std::runtime_error("LOG1 runtime graphics requires ALGP Europe Rev 0");
     }
-    std::filesystem::remove_all(output);
+    std::filesystem::remove_all(output / "sprites");
+    std::filesystem::remove(output / "sprites.csv");
+    std::filesystem::remove(output / "sprites_gallery.html");
     std::filesystem::create_directories(output / "sprites");
 
     Log1RuntimeSession sprite_session(rom);
@@ -621,37 +916,122 @@ void export_log1_runtime_graphics(
         log1_sprite_count,
         3);
 
+    export_log1_runtime_tilesets(rom, output);
+
     std::ofstream level_status(output / "LOG1_level_structure_status.txt");
     level_status
         << "Legacy of Goku level extraction status\n"
         << "========================================\n\n"
         << "The former 240x160 Sprite Viewer and Go To Map captures have been "
-           "removed. Sprite sheets now contain only transparent GBA OBJ/OAM "
-           "pixels sampled from the selected Sprite Viewer resource; menu art, "
-           "background layers, borders and character-gallery illustrations are "
-           "not copied into the PNGs. Complete LOG1 map records and full layer "
-           "grids remain under reconstruction.\n";
+           "removed. Sprite sheets contain only transparent GBA OBJ/OAM pixels. "
+           "runtime_tilesets contains background character data decoded directly "
+           "from GBA VRAM with active RGB555 palettes and per-map palette-bank "
+           "usage. These PNGs are actual tile atlases, not viewport screenshots. "
+           "Complete LOG1 map records and full layer grids remain under "
+           "reconstruction.\n";
 
     std::ofstream note(output / "README.txt");
     note << "Legacy of Goku OBJ sprite export\n"
          << "=================================\n\n"
-         << "Each PNG is a transparent sheet of unique animated OBJ frames from "
-            "the hidden Sprite Viewer preview area. The previous full-screen "
-            "captures containing menu artwork are no longer generated.\n";
+         << "Each sprite PNG is a transparent sheet of unique animated OBJ "
+            "frames from the hidden Sprite Viewer preview area. "
+            "tileset_gallery.html displays background tile atlases read from "
+            "VRAM after loading each Go To Map selection; no menu or viewport "
+            "screenshots are used.\n";
+}
+
+void render_log1_runtime_track_preview_wav(
+    const Rom& rom,
+    std::size_t track,
+    const std::filesystem::path& output_path,
+    unsigned seconds) {
+    if (!is_log1_rom(rom)) {
+        throw std::runtime_error(
+            "LOG1 runtime soundtrack requires ALGP Europe Rev 0");
+    }
+    if (track >= log1_music_count) {
+        throw std::out_of_range("LOG1 track index is out of range");
+    }
+    if (seconds == 0U || seconds > 300U) {
+        throw std::out_of_range(
+            "LOG1 preview duration must be between 1 and 300 seconds");
+    }
+
+    Log1RuntimeSession session(rom);
+    session.boot_to_debug_menu();
+    session.press(key_down, 6, 8);
+    session.press(key_down, 6, 8);
+    session.press(key_down, 6, 8);
+    for (std::size_t index = 0; index < track; ++index) {
+        session.press(key_right, 3, 5);
+    }
+    session.press(key_a, 6, 10);
+    session.audio().clear();
+    session.run_frames((seconds + 1U) * 60U);
+    write_stereo_wav(
+        output_path,
+        fixed_duration_audio(session.audio().samples(), seconds));
+}
+
+BgmRenderResult render_log1_runtime_track_full_wav(
+    const Rom& rom,
+    std::size_t track,
+    const std::filesystem::path& output_path,
+    unsigned maximum_seconds,
+    unsigned loop_count,
+    unsigned fade_seconds) {
+    if (!is_log1_rom(rom)) {
+        throw std::runtime_error(
+            "LOG1 runtime soundtrack requires ALGP Europe Rev 0");
+    }
+    if (track >= log1_music_count) {
+        throw std::out_of_range("LOG1 track index is out of range");
+    }
+
+    Log1RuntimeSession session(rom);
+    session.boot_to_debug_menu();
+    session.press(key_down, 6, 8);
+    session.press(key_down, 6, 8);
+    session.press(key_down, 6, 8);
+    for (std::size_t index = 0; index < track; ++index) {
+        session.press(key_right, 3, 5);
+    }
+    session.press(key_a, 6, 10);
+    session.audio().clear();
+    session.run_frames((maximum_seconds + 1U) * 60U);
+    return write_full_stereo_wav_from_capture(
+        session.audio().samples(),
+        audio_sample_rate,
+        output_path,
+        maximum_seconds,
+        loop_count,
+        fade_seconds);
+}
+
+void write_runtime_audio_progress(
+    const std::filesystem::path& soundtrack_directory,
+    const std::string& message) {
+    std::filesystem::create_directories(soundtrack_directory);
+    std::ofstream progress(soundtrack_directory / ".audio_progress.txt");
+    progress << message << '\n';
 }
 
 void export_log1_runtime_soundtrack(
     const Rom& rom,
     const std::filesystem::path& output,
-    unsigned seconds_per_track) {
+    unsigned maximum_seconds_per_track) {
     if (!is_log1_rom(rom)) {
-        throw std::runtime_error("LOG1 runtime soundtrack requires ALGP Europe Rev 0");
+        throw std::runtime_error(
+            "LOG1 runtime soundtrack requires ALGP Europe Rev 0");
     }
-    if (seconds_per_track < 5U || seconds_per_track > 300U) {
-        throw std::out_of_range("LOG1 track duration must be between 5 and 300 seconds");
+    if (maximum_seconds_per_track < 30U ||
+        maximum_seconds_per_track > 900U) {
+        throw std::out_of_range(
+            "LOG1 full-track maximum must be between 30 and 900 seconds");
     }
 
-    constexpr const char* cache_version = "DragonByteZ-0.6.18-LOG1-runtime-WAV";
+    constexpr const char* cache_version =
+        "DragonByteZ-0.7.6-LOG1-declicked-interpolated-full-WAV";
     std::filesystem::create_directories(output);
     const std::filesystem::path marker = output / ".music_cache_version";
     bool cache_matches = false;
@@ -672,7 +1052,8 @@ void export_log1_runtime_soundtrack(
     }
 
     std::ofstream csv(output / "tracks.csv");
-    csv << "track,debug_value,duration_seconds,wav,status\n";
+    csv << "track,duration_seconds,loop_detected,loop_start_seconds,"
+           "loop_length_seconds,natural_end,wav,status\n";
     std::ofstream playlist(output / "DragonByteZ_LOG1.m3u");
 
     std::unique_ptr<Log1RuntimeSession> session;
@@ -688,41 +1069,95 @@ void export_log1_runtime_soundtrack(
     };
 
     std::size_t selected_track = 0;
+    const std::filesystem::path progress_directory = output.parent_path();
     for (std::size_t track = 0; track < log1_music_count; ++track) {
-        const std::string filename = numbered_filename("track_", track, ".wav", 2);
+        write_runtime_audio_progress(
+            progress_directory,
+            "Rendering full track " + std::to_string(track + 1U) + " of " +
+                std::to_string(log1_music_count) + "...");
+
+        const std::string filename =
+            numbered_filename("track_", track, ".wav", 2);
         const std::filesystem::path wav_path = output / "tracks" / filename;
         bool reused = false;
+        bool rendered = false;
+        BgmRenderResult render_result;
         std::error_code error;
+        std::string failure;
+
         if (std::filesystem::is_regular_file(wav_path, error) &&
-            !error && std::filesystem::file_size(wav_path, error) > 44U && !error) {
+            !error && std::filesystem::file_size(wav_path, error) > 44U &&
+            !error) {
             reused = true;
         } else {
-            Log1RuntimeSession& active = ensure_sound_test();
-            while (selected_track < track) {
-                active.press(key_right, 3, 5);
-                ++selected_track;
+            try {
+                Log1RuntimeSession& active = ensure_sound_test();
+                while (selected_track < track) {
+                    active.press(key_right, 3, 5);
+                    ++selected_track;
+                }
+                active.press(key_a, 6, 10);
+                active.audio().clear();
+                active.run_frames((maximum_seconds_per_track + 1U) * 60U);
+                render_result = write_full_stereo_wav_from_capture(
+                    active.audio().samples(),
+                    audio_sample_rate,
+                    wav_path,
+                    maximum_seconds_per_track,
+                    2,
+                    5);
+                rendered = true;
+            } catch (const std::exception& render_error) {
+                failure = render_error.what();
+                std::filesystem::remove(wav_path, error);
+                session.reset();
+                selected_track = 0;
             }
-            active.press(key_a, 6, 10);
-            active.audio().clear();
-            active.run_frames((seconds_per_track + 1U) * 60U);
-            const auto samples = fixed_duration_audio(
-                active.audio().samples(),
-                seconds_per_track);
-            write_stereo_wav(wav_path, samples);
         }
-        csv << track << ',' << track << ',' << seconds_per_track << ','
-            << filename << ',' << (reused ? "cached" : "rendered") << '\n';
-        playlist << "tracks/" << filename << '\n';
+
+        csv << track << ',';
+        if (reused) {
+            csv << "cached,cached,cached,cached,cached,";
+        } else if (rendered) {
+            csv << render_result.duration_seconds << ','
+                << (render_result.loop_detected ? 1 : 0) << ','
+                << render_result.loop_start_seconds << ','
+                << render_result.loop_length_seconds << ','
+                << (render_result.natural_end_detected ? 1 : 0) << ',';
+        } else {
+            csv << "failed,failed,failed,failed,failed,";
+        }
+
+        csv << filename << ',';
+        if (reused) {
+            csv << "cached";
+        } else if (rendered) {
+            csv << "rendered";
+        } else {
+            csv << "failed: " << failure;
+        }
+        csv << '\n';
+
+        if (reused || rendered) {
+            playlist << "tracks/" << filename << '\n';
+        }
     }
 
+    write_runtime_audio_progress(
+        progress_directory,
+        "Full track rendering complete.");
+
     std::ofstream note(output / "README.txt");
-    note << "Legacy of Goku original-engine music export\n"
-         << "===========================================\n\n"
+    note << "Legacy of Goku original-engine full music export\n"
+         << "================================================\n\n"
          << "All " << log1_music_count
          << " entries are selected through the hidden Play Music sound test "
             "and rendered by the embedded GBA engine as 44.1 kHz stereo WAV "
-            "previews. Existing previews are reused. No sequence BIN, GSF, "
-            "miniGSF or candidate data files are written.\n";
+            "files. DragonByteZ writes the complete non-looping track or, for "
+            "looping music, the introduction plus two detected loops followed "
+            "by a five-second fade. The maximum fallback is "
+         << maximum_seconds_per_track
+         << " seconds when a loop or natural end cannot be identified.\n";
 }
 
 

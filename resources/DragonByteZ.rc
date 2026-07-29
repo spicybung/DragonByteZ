@@ -2,4 +2,5 @@
 
 101 ICON "DragonByteZ.ico"
 102 WAVE "DragonByteZ_intro.wav"
+103 PNG "header_banner.png"
 1 RT_MANIFEST "DragonByteZ.manifest"
