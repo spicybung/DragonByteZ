@@ -1,6 +1,6 @@
 # DragonByteZ
 
-DragonByteZ is a reverse-engineering tool currently compatible for the Game Boy Advance Webfoot Dragon Ball Z games:
+DragonByteZ is a reverse-engineering tool currently compatible for the following Game Boy Advance Webfoot Dragon Ball Z games:
 
 - *Dragon Ball Z: The Legacy of Goku* Europe Rev 0 (`ALGP`)
 - *Dragon Ball Z: The Legacy of Goku II* Europe Rev 0 (`ALFP`)
